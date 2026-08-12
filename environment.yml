@@ -1,0 +1,26 @@
+# Полное окружение одной командой (рекомендуемый путь — libomp ставится сам):
+#
+#   conda env create -f environment.yml
+#   conda activate ecup
+#
+name: ecup
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - llvm-openmp        # без него LightGBM на macOS не импортируется
+  - numpy=2.4.6
+  - scipy=1.17.1
+  - scikit-learn=1.9.0
+  - pandas=3.0.3
+  - pyarrow=24.0.0
+  - statsmodels=0.14.6
+  - ipykernel=7.3.0
+  - nbformat=5.10.4
+  - nbconvert=7.17.1
+  - jupyter_core=5.9.1
+  - pip
+  - pip:
+      - polars==1.43.2
+      - lightgbm==4.7.0
+      - plotly==6.8.0

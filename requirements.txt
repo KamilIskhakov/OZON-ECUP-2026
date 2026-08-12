@@ -1,0 +1,29 @@
+# OZON E-CUP 2026 — Search LTV
+# Python 3.11
+#
+#   pip install -r requirements.txt
+#
+# ВАЖНО для macOS: LightGBM собран с OpenMP и без libomp не импортируется
+# (OSError: Library not loaded: @rpath/libomp.dylib). Поставьте одно из:
+#   conda install -c conda-forge llvm-openmp
+#   brew install libomp
+# На Linux и Windows отдельных действий не нужно.
+
+# --- ядро решения (src/ecup) -------------------------------------------------
+polars==1.43.2            # вся работа с панелью 30.6 млн строк
+pyarrow==24.0.0           # чтение parquet
+numpy==2.4.6
+lightgbm==4.7.0           # HurdleGBDT / DirectGBDT
+scikit-learn==1.9.0       # propensity score, матчинг, препроцессинг
+
+# --- анализ (notebooks/) -----------------------------------------------------
+plotly==6.8.0             # вся графика
+scipy==1.17.1             # ранговые корреляции, кластеризация признаков
+pandas==3.0.3
+statsmodels==0.14.6       # временные ряды в разведочном ноутбуке
+
+# --- запуск ноутбуков --------------------------------------------------------
+ipykernel==7.3.0
+nbformat==5.10.4
+nbconvert==7.17.1
+jupyter-core==5.9.1

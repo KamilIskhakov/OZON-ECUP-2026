@@ -1,0 +1,21 @@
+# Данные соревнования — не выкладываются в репозиторий
+data_start/
+
+# Кеш панели: пересобирается из data_start/ автоматически (~160 MB)
+data_work/
+
+# Сабмиты и результаты свипов
+artifacts/*.csv
+!artifacts/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+*.egg-info/
+
+# ОС и редакторы
+.DS_Store
+.vscode/
+.idea/
