@@ -10,6 +10,7 @@ import polars as pl
 from .config import SplitConfig, Windows, anchor_label
 from .data import anchor_population, make_target
 from .features import build_features, feature_names
+from .state import state_features
 
 
 @dataclass
@@ -48,6 +49,9 @@ def build_anchor(
 ) -> AnchorFrame:
     users = anchor_population(df, anchor, split.apply_selection)
     X = build_features(df, anchor, users, max_history=split.max_history, windows=windows)
+    if split.with_state:
+        X = X.join(state_features(df, anchor, users, span=split.max_history),
+                   on="user_id", how="left")
     nan_lvl = AnchorLevel(float("nan"), float("nan"), float("nan"))
     if not with_target:
         return AnchorFrame(anchor=anchor, X=X, y=np.zeros(X.height), level=nan_lvl)

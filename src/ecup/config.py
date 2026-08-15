@@ -94,6 +94,10 @@ class SplitConfig:
     n_train_anchors: int | None = 6   # None — взять максимум помещающихся
     horizon: int = HORIZON
     apply_selection: bool = True      # применять правило отбора на каждом якоре
+    # Признаки динамического состояния (EWMA + байесовские фильтры активности
+    # и конверсии). Замер на одном якоре: +0.0033 к shape, и они забирают
+    # верхние места по важности в обеих головах.
+    with_state: bool = True
     # Разрешить якоря с неполной историей. Признаки тогда считаются по тому,
     # что есть; глубину видно модели через hist_span и avail_history.
     allow_partial_history: bool = True

@@ -22,6 +22,7 @@ from .metrics import (best_constant, correct_oversampling_prior, hurdle_glue,
 from .model import DirectGBDT, HurdleGBDT
 from .pipeline import (ValidationResult, make_submission, run_validation,
                        sweep_anchors, sweep_history)
+from .state import bayes_filters, ewma_features, state_features
 
 __all__ = [
     "ANCHOR_FINAL", "ANCHOR_VAL", "HORIZON", "ModelConfig", "SplitConfig", "Windows",
@@ -33,5 +34,6 @@ __all__ = [
     "level_shift_cost", "rmsle", "summarize",
     "DirectGBDT", "HurdleGBDT",
     "ValidationResult", "make_submission", "run_validation", "sweep_anchors", "sweep_history",
+    "bayes_filters", "ewma_features", "state_features",
 ]
 __version__ = "0.1.0"
