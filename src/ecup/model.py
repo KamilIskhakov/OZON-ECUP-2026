@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 import lightgbm as lgb
 import numpy as np
+from sklearn.model_selection import train_test_split
 
 from .config import ModelConfig
 from .metrics import hurdle_glue
@@ -35,6 +36,8 @@ class HurdleGBDT:
         sample_weight: np.ndarray | None = None,
         z_offset: np.ndarray | None = None,
         clf_init: np.ndarray | None = None,
+        early_stopping_rounds: int | None = None,
+        eval_frac: float = 0.12,
     ) -> "HurdleGBDT":
         """Обучить обе головы, каждую со своим офсетом якоря.
 
@@ -48,21 +51,56 @@ class HurdleGBDT:
         y = np.asarray(y, dtype="float64")
         pos = y > 0
         self.feature_names = feature_names or self.feature_names
-
-        self.clf = lgb.LGBMClassifier(random_state=self.config.seed, **self.config.clf_params)
-        self.clf.fit(X, pos.astype(np.int8), sample_weight=sample_weight,
-                     init_score=None if clf_init is None else np.asarray(clf_init, "float64"))
+        n = len(y)
+        init = None if clf_init is None else np.asarray(clf_init, "float64")
         self._clf_has_init = clf_init is not None
+
+        # Отложенная часть для ранней остановки. Делим по пользователям внутри
+        # трейна: число деревьев подбирается на не виденных строках, а качество
+        # всё равно меряется на отдельном по времени якоре.
+        if early_stopping_rounds:
+            idx_tr, idx_es = train_test_split(
+                np.arange(n), test_size=eval_frac, random_state=self.config.seed,
+                stratify=pos)
+        else:
+            idx_tr, idx_es = np.arange(n), None
+
+        sub = lambda a, i: None if a is None else a[i]
+        self.clf = lgb.LGBMClassifier(random_state=self.config.seed, **self.config.clf_params)
+        kw = {}
+        if idx_es is not None:
+            kw = dict(
+                eval_set=[(X[idx_es], pos[idx_es].astype(np.int8))],
+                eval_metric="binary_logloss",
+                eval_sample_weight=None if sample_weight is None else [sample_weight[idx_es]],
+                eval_init_score=None if init is None else [init[idx_es]],
+                callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)],
+            )
+        self.clf.fit(X[idx_tr], pos[idx_tr].astype(np.int8),
+                     sample_weight=sub(sample_weight, idx_tr),
+                     init_score=sub(init, idx_tr), **kw)
 
         if pos.sum() < 100:
             raise ValueError(f"позитивов слишком мало для регрессии: {int(pos.sum())}")
-        w_pos = None if sample_weight is None else sample_weight[pos]
-        z = np.log1p(y[pos])
+        z = np.log1p(y)
         if z_offset is not None:
-            z = z - np.asarray(z_offset, dtype="float64")[pos]
+            z = z - np.asarray(z_offset, dtype="float64")
+        ptr = idx_tr[pos[idx_tr]]
         self.reg = lgb.LGBMRegressor(random_state=self.config.seed, **self.config.reg_params)
-        self.reg.fit(X[pos], z, sample_weight=w_pos)
+        kw = {}
+        if idx_es is not None:
+            pes = idx_es[pos[idx_es]]
+            kw = dict(eval_set=[(X[pes], z[pes])], eval_metric="l2",
+                      eval_sample_weight=None if sample_weight is None else [sample_weight[pes]],
+                      callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)])
+        self.reg.fit(X[ptr], z[ptr], sample_weight=sub(sample_weight, ptr), **kw)
         return self
+
+    @property
+    def best_iters(self) -> tuple[int, int]:
+        """Сколько деревьев реально понадобилось каждой голове."""
+        return (getattr(self.clf, "best_iteration_", None) or self.clf.n_estimators,
+                getattr(self.reg, "best_iteration_", None) or self.reg.n_estimators)
 
     def predict_parts(
         self,

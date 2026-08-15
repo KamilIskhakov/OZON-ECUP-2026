@@ -127,7 +127,9 @@ def run_validation(
 
     hur = HurdleGBDT(config=model_config).fit(
         Xtr, ytr, feature_names=feats, sample_weight=w,
-        z_offset=z_off, clf_init=clf_init)
+        z_offset=z_off, clf_init=clf_init,
+        early_stopping_rounds=model_config.early_stopping_rounds,
+        eval_frac=model_config.eval_frac)
     dir_ = DirectGBDT(config=model_config).fit(
         Xtr, ytr, feature_names=feats, sample_weight=w,
         z_offset=None if z_off is None else np.full(len(ytr), last.l))
@@ -274,7 +276,9 @@ def make_submission(
 
     model = HurdleGBDT(config=model_config).fit(
         Xtr, ytr, feature_names=feats, sample_weight=w,
-        z_offset=z_off, clf_init=clf_init)
+        z_offset=z_off, clf_init=clf_init,
+        early_stopping_rounds=model_config.early_stopping_rounds,
+        eval_frac=model_config.eval_frac)
     z_h = np.log1p(model.predict(
         (Xfi := to_matrix(
             (final := build_anchor(df, split.final_anchor, split, windows,

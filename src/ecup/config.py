@@ -149,3 +149,8 @@ class ModelConfig:
         bagging_freq=1, lambda_l2=5.0, n_estimators=600, verbose=-1, n_jobs=-1,
     ))
     seed: int = 42
+    # Ранняя остановка на отложенной доле трейна. Замер на одном якоре:
+    # фиксированные 600 деревьев дают shape 1.69291, ранняя остановка
+    # (оптимум 149 и 87 деревьев) — 1.68657. Модель была переобучена.
+    early_stopping_rounds: int | None = 100
+    eval_frac: float = 0.12
