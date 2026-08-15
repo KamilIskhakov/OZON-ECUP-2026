@@ -143,6 +143,7 @@ def state_features(
     span: int = 365,
     with_ewma: bool = True,
     with_bayes: bool = True,
+    with_rhythm: bool = True,
 ) -> pl.DataFrame:
     """Полный блок признаков состояния."""
     out = pl.DataFrame({"user_id": users})
@@ -150,4 +151,71 @@ def state_features(
         out = out.join(ewma_features(df, anchor, users, span), on="user_id", how="left")
     if with_bayes:
         out = out.join(bayes_filters(df, anchor, users, span), on="user_id", how="left")
+    if with_rhythm:
+        out = out.join(purchase_rhythm(df, anchor, users, span), on="user_id", how="left")
     return out.sort("user_id")
+
+
+def purchase_rhythm(
+    df: pl.DataFrame,
+    anchor: int,
+    users: pl.Series,
+    span: int = 365,
+) -> pl.DataFrame:
+    """Ритм ПОКУПОК, а не визитов.
+
+    BTYD-lite в features.py нормирует recency на медианный интервал между
+    визитами. Но по важности признаков видно, что сигнал сидит в покупках:
+    `p_buy_slow` забирает больше половины гейна классификатора. Значит и ритм
+    надо мерить по покупкам — интервалы между днями с gmv > 0, а не между
+    заходами на площадку.
+
+    Ключевой признак — `r_gmv_over_gap`: сколько собственных покупательских
+    циклов пользователь молчит. 28 дней тишины у того, кто покупает раз
+    в неделю, и у того, кто покупает раз в два месяца, означают разное.
+    """
+    h = (
+        df.filter(pl.col("user_id").is_in(users)
+                  & pl.col("d").is_between(anchor - span + 1, anchor)
+                  & (pl.col("gmv") > 0))
+          .select(["user_id", "d", "gmv"])
+          .sort(["user_id", "d"])
+    )
+    gaps = (
+        h.with_columns(gap=(pl.col("d") - pl.col("d").shift(1).over("user_id")))
+         .drop_nulls("gap")
+    )
+    g = gaps.group_by("user_id").agg(
+        buy_gap_mean=pl.col("gap").mean(),
+        buy_gap_median=pl.col("gap").median(),
+        buy_gap_std=pl.col("gap").std(),
+        buy_gap_max=pl.col("gap").max(),
+        buy_gap_last=pl.col("gap").last(),
+        buy_gap_last3=pl.col("gap").tail(3).mean(),
+    )
+    a = h.group_by("user_id").agg(
+        n_buy_days=pl.len(),
+        first_buy_ago=(anchor - pl.col("d").min()),
+        last_buy_ago=(anchor - pl.col("d").max()),
+        buy_gmv_mean=pl.col("gmv").log1p().mean(),
+        buy_gmv_std=pl.col("gmv").log1p().std(),
+        buy_gmv_max=pl.col("gmv").log1p().max(),
+        buy_gmv_last=pl.col("gmv").log1p().last(),
+        buy_gmv_last3=pl.col("gmv").log1p().tail(3).mean(),
+    )
+    f = (
+        pl.DataFrame({"user_id": users})
+          .join(a, on="user_id", how="left")
+          .join(g, on="user_id", how="left")
+          .with_columns(pl.exclude("user_id").fill_null(0.0))
+    )
+    return f.with_columns(
+        # молчание в собственных покупательских циклах
+        (pl.col("last_buy_ago") / (pl.col("buy_gap_median") + 1.0)).alias("r_gmv_over_gap"),
+        (pl.col("last_buy_ago") / (pl.col("buy_gap_mean") + 1.0)).alias("r_gmv_over_gapm"),
+        # ускоряется или замедляется покупательский ритм
+        (pl.col("buy_gap_last3") - pl.col("buy_gap_mean")).alias("buy_gap_trend"),
+        # свежие покупки крупнее или мельче собственного среднего
+        (pl.col("buy_gmv_last3") - pl.col("buy_gmv_mean")).alias("buy_gmv_trend"),
+        (pl.col("n_buy_days") / (pl.col("first_buy_ago") + 1.0)).alias("buy_rate_since_first"),
+    ).sort("user_id")
