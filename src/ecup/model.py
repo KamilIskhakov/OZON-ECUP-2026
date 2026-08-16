@@ -27,6 +27,7 @@ class HurdleGBDT:
     clf: lgb.LGBMClassifier | None = None
     reg: lgb.LGBMRegressor | None = None
     _clf_has_init: bool = False
+    _refit_iters: tuple[int, int] | None = None
 
     def fit(
         self,
@@ -38,6 +39,7 @@ class HurdleGBDT:
         clf_init: np.ndarray | None = None,
         early_stopping_rounds: int | None = None,
         eval_frac: float = 0.12,
+        refit_full: bool = False,
     ) -> "HurdleGBDT":
         """Обучить обе головы, каждую со своим офсетом якоря.
 
@@ -94,6 +96,21 @@ class HurdleGBDT:
                       eval_sample_weight=None if sample_weight is None else [sample_weight[pes]],
                       callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)])
         self.reg.fit(X[ptr], z[ptr], sample_weight=sub(sample_weight, ptr), **kw)
+
+        # Ранняя остановка отъедает eval_frac обучающих строк. Для финальной
+        # модели это чистая потеря: число деревьев уже найдено, и его можно
+        # переиспользовать, дообучившись на всех данных. Масштабируем на
+        # 1/(1-eval_frac) — с большим трейном оптимум сдвигается вправо.
+        if refit_full and idx_es is not None:
+            scale = 1.0 / (1.0 - eval_frac)
+            bc, br = self.best_iters
+            cp = {**self.config.clf_params, "n_estimators": max(1, int(round(bc * scale)))}
+            rp = {**self.config.reg_params, "n_estimators": max(1, int(round(br * scale)))}
+            self.clf = lgb.LGBMClassifier(random_state=self.config.seed, **cp)
+            self.clf.fit(X, pos.astype(np.int8), sample_weight=sample_weight, init_score=init)
+            self.reg = lgb.LGBMRegressor(random_state=self.config.seed, **rp)
+            self.reg.fit(X[pos], z[pos], sample_weight=sub(sample_weight, pos))
+            self._refit_iters = (cp["n_estimators"], rp["n_estimators"])
         return self
 
     @property

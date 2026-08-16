@@ -154,3 +154,5 @@ class ModelConfig:
     # (оптимум 149 и 87 деревьев) — 1.68657. Модель была переобучена.
     early_stopping_rounds: int | None = 100
     eval_frac: float = 0.12
+    # Для финального сабмита: дообучить на 100 % данных с найденным числом деревьев
+    refit_full: bool = False
