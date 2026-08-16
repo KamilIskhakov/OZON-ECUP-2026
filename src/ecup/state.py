@@ -22,6 +22,8 @@ from __future__ import annotations
 import numpy as np
 import polars as pl
 
+from .features import EPS, RECENCY_NEVER
+
 # Периоды полураспада ≈ 6.6, 23 и 138 дней: короткая, средняя и длинная память.
 DELTAS: tuple[tuple[str, float], ...] = (("fast", 0.90), ("mid", 0.97), ("slow", 0.995))
 CHANNELS: tuple[tuple[str, str], ...] = (
@@ -144,6 +146,7 @@ def state_features(
     with_ewma: bool = True,
     with_bayes: bool = True,
     with_rhythm: bool = True,
+    with_phantom: bool = True,
 ) -> pl.DataFrame:
     """Полный блок признаков состояния."""
     out = pl.DataFrame({"user_id": users})
@@ -153,6 +156,8 @@ def state_features(
         out = out.join(bayes_filters(df, anchor, users, span), on="user_id", how="left")
     if with_rhythm:
         out = out.join(purchase_rhythm(df, anchor, users, span), on="user_id", how="left")
+    if with_phantom:
+        out = out.join(phantom_recency(df, anchor, users, span), on="user_id", how="left")
     return out.sort("user_id")
 
 
@@ -219,3 +224,43 @@ def purchase_rhythm(
         (pl.col("buy_gmv_last3") - pl.col("buy_gmv_mean")).alias("buy_gmv_trend"),
         (pl.col("n_buy_days") / (pl.col("first_buy_ago") + 1.0)).alias("buy_rate_since_first"),
     ).sort("user_id")
+
+
+def phantom_recency(
+    df: pl.DataFrame,
+    anchor: int,
+    users: pl.Series,
+    span: int = 365,
+) -> pl.DataFrame:
+    """Recency по СТРОГОМУ определению активности плюс разница с обычным.
+
+    15.2 % строк имеют search = 0 и cat = 0: активность в базе есть, но канал
+    не проставлен. Такие дни несут 0.54 % всего GMV, то есть не мусор, но и
+    не полноценный визит. Считать ли их активным днём — выбор, который меняет
+    recency у заметной доли пользователей.
+
+    Вместо того чтобы выбирать, подаём обе версии и саму разницу между ними:
+    величина расхождения информативна сама по себе — она показывает, насколько
+    активность пользователя состоит из неатрибутированных дней.
+    """
+    real = (pl.col("search") == 1) | (pl.col("cat") == 1)
+    h = df.filter(pl.col("user_id").is_in(users)
+                  & pl.col("d").is_between(anchor - span + 1, anchor))
+    f = h.group_by("user_id").agg(
+        r_act_strict=(anchor - pl.col("d").filter(real).max()),
+        n_real_days=real.sum(),
+        n_phantom_days=(~real).sum(),
+        r_act_any=(anchor - pl.col("d").max()),
+    )
+    f = (pl.DataFrame({"user_id": users}).join(f, on="user_id", how="left")
+           .with_columns(pl.col("r_act_strict").fill_null(RECENCY_NEVER),
+                         pl.col("r_act_any").fill_null(RECENCY_NEVER),
+                         pl.col("n_real_days").fill_null(0),
+                         pl.col("n_phantom_days").fill_null(0)))
+    return f.with_columns(
+        # сколько дней «съедает» строгое определение — ноль означает, что
+        # последний визит был полноценным
+        (pl.col("r_act_strict") - pl.col("r_act_any")).alias("r_act_gap"),
+        (pl.col("n_phantom_days")
+         / (pl.col("n_real_days") + pl.col("n_phantom_days") + EPS)).alias("phantom_share"),
+    ).drop("r_act_any").sort("user_id")

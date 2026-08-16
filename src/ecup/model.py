@@ -201,3 +201,104 @@ class DirectGBDT:
         imp = imp / max(imp.sum(), 1)
         order = np.argsort(-imp)[:top]
         return [(names[i], float(imp[i])) for i in order]
+
+
+def metric_aligned_objective(p: np.ndarray, offset: np.ndarray | None = None):
+    """Лосс регрессии, согласованный с итоговой метрикой.
+
+    Текущая схема обучает две головы двумя локальными лоссами: классификатор
+    логлоссом, регрессию — MSE на позитивах. Итоговую ошибку (p·m − z)²
+    не оптимизирует ни одна из них. Асимптотически это неважно, но при
+    конечной выборке, регуляризации и ограниченной ёмкости произведение
+    двух состоятельных оценок не обязано быть лучшей оценкой z.
+
+    Здесь регрессия учится прямо под метрику. Если финальный прогноз
+    ẑ = p·(f + ℓ), то минимизируется
+
+        L_i(f) = w_i · (p_i·(f_i + ℓ_i) − z_i)²
+
+    Градиент 2·w·p·(p(f+ℓ) − z), гессиан 2·w·p² ≥ 0 — задача выпуклая.
+
+    Уровень ℓ входит ВНУТРЬ скобки, до умножения на p. Вычитать его из
+    метки нельзя: тогда лосс стал бы (p·f + ℓ − z)² вместо (p·f + p·ℓ − z)²,
+    и ошибка составила бы (1−p)·ℓ — тем большая, чем реже человек покупает.
+    Это тот же класс ошибки, что и прибавление сдвига к готовому p·m.
+
+    Веса применяются ВРУЧНУЮ: LightGBM не передаёт sample_weight в custom
+    objective с двумя аргументами и не применяет их к возвращённым
+    градиентам — проверено эмпирически. Поэтому сигнатура трёхаргументная.
+
+    Что оценивает f. При истинном p оптимум f* = E[z|x]/p(x) = m(x). Но если
+    классификатор смещён, оптимум становится p(x)m(x)/p̃(x), то есть f
+    начинает компенсировать ошибку классификатора. Для метрики это хорошо
+    (произведение p̃·f по-прежнему стремится к E[z|x]), но интерпретация
+    «условная сумма покупки» теряется — поэтому величина называется
+    conditional score, а не m.
+
+    `p` обязан быть OOF-прогнозом: иначе в цель просачивается информация
+    о таргете тех же строк.
+    """
+    p = np.asarray(p, dtype="float64")
+    off = None if offset is None else np.asarray(offset, dtype="float64")
+
+    def objective(y_true, y_pred, weight):
+        f = y_pred if off is None else y_pred + off
+        resid = p * f - y_true
+        grad = 2.0 * p * resid
+        hess = 2.0 * p * p
+        if weight is not None:
+            grad = grad * weight
+            hess = hess * weight
+        return grad, hess
+
+    return objective
+
+
+def metric_aligned_init(p, z, offset=None, weight=None) -> float:
+    """Аналитический стартовый скор для этого лосса.
+
+    Оптимальная константа c решает d/dc Σ w p (p(c+ℓ) − z)² = 0:
+
+        c* = Σ w p (z − p ℓ) / Σ w p²
+
+    Медиана положительных, которую легко подставить по привычке, к оптимуму
+    этого лосса отношения не имеет.
+    """
+    p = np.asarray(p, "float64"); z = np.asarray(z, "float64")
+    w = np.ones_like(p) if weight is None else np.asarray(weight, "float64")
+    num = w * p * (z if offset is None else z - p * np.asarray(offset, "float64"))
+    return float(num.sum() / max((w * p * p).sum(), 1e-12))
+
+
+@dataclass
+class MetricAlignedGBDT:
+    """Conditional score под лосс (p·(f+ℓ) − z)² при зафиксированном OOF p."""
+
+    config: ModelConfig = field(default_factory=ModelConfig)
+    feature_names: list[str] | None = None
+    reg: lgb.LGBMRegressor | None = None
+    _init: float = 0.0
+
+    def fit(self, X, y, p_oof, feature_names=None, sample_weight=None,
+            m_offset=None) -> "MetricAlignedGBDT":
+        """`m_offset` — уровень ℓ⁺ якоря; None означает абсолютный режим."""
+        self.feature_names = feature_names or self.feature_names
+        z = np.log1p(np.asarray(y, "float64"))
+        self._init = metric_aligned_init(p_oof, z, m_offset, sample_weight)
+        params = {k: v for k, v in self.config.reg_params.items()
+                  if k not in ("objective", "metric")}
+        # Стартовый скор обязан входить В ОБУЧЕНИЕ, а не только в predict:
+        # иначе бустинг ищет f с p·f ≈ z, а наружу отдаётся f + init.
+        base = np.full(len(z), self._init, dtype="float64")
+        off = base if m_offset is None else np.asarray(m_offset, "float64") + base
+        self.reg = lgb.LGBMRegressor(
+            random_state=self.config.seed,
+            objective=metric_aligned_objective(p_oof, off), **params)
+        # init_score не входит в predict — проверено; прибавляем вручную
+        self.reg.fit(X, z, sample_weight=sample_weight,
+                     init_score=np.zeros(len(z)))
+        return self
+
+    def predict(self, X, m_offset: float = 0.0) -> np.ndarray:
+        """Conditional score; умножать на p для итогового ẑ."""
+        return self.reg.predict(X) + self._init + m_offset
