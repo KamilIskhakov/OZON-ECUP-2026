@@ -226,3 +226,41 @@ def feature_names(
     if drop_anchor_calendar:
         drop.update(ANCHOR_CALENDAR)
     return [c for c in frame.columns if c not in drop]
+
+
+# Признаки, для которых имеет смысл положение внутри текущей популяции:
+# непрерывные, с дрейфующим между якорями распределением.
+RANK_BASE: tuple[str, ...] = (
+    "gmv_30", "gmv_90", "gmv_180", "ord_90", "cart_90", "srch_90",
+    "act_days_30", "act_days_90", "ord_days_90", "aov_mid",
+    "r_act", "r_gmv", "gmv_per_active", "density_mid",
+    "ewm_gmv_slow", "ewm_gmv_fs", "ewm_act_fs",
+    "p_buy_slow", "p_buy_fast", "q_active_slow", "c_conv_slow", "amt_slow",
+    "n_buy_days", "buy_gap_median", "r_gmv_over_gap",
+)
+
+
+def anchor_relative(frame: pl.DataFrame, cols: tuple[str, ...] = RANK_BASE) -> pl.DataFrame:
+    """Положение пользователя внутри СВОЕЙ популяции якоря.
+
+    Дерево делит по абсолютному порогу: сплит `gmv_90 > 5000`, обученный
+    на осеннем якоре, в феврале означает другое состояние — распределения
+    между якорями дрейфуют. Перцентиль внутри якоря такому дрейфу не
+    подвержен: «верхние 13 % по GMV» значат одно и то же везде.
+
+    Для дерева это не избыточно, хотя внутри одного якоря преобразование
+    монотонно: функция распределения $F_T$ РАЗНАЯ на разных якорях, поэтому
+    ранг приводит их к общей шкале, а абсолютное значение — нет.
+
+    Добавляется два представления: перцентиль и робастный z-скор по медиане
+    и межквартильному размаху (устойчив к тяжёлым хвостам, которых здесь много).
+    """
+    have = [c for c in cols if c in frame.columns]
+    n = frame.height
+    ex: list[pl.Expr] = []
+    for c in have:
+        ex.append((pl.col(c).rank("average") / n).cast(pl.Float32).alias(f"pct_{c}"))
+        med = pl.col(c).median()
+        iqr = pl.col(c).quantile(0.75) - pl.col(c).quantile(0.25)
+        ex.append(((pl.col(c) - med) / (iqr + EPS)).cast(pl.Float32).alias(f"rz_{c}"))
+    return frame.with_columns(ex)

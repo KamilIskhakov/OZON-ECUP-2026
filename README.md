@@ -1,37 +1,38 @@
 # OZON E-CUP 2026 · Search LTV
 
-Прогноз суммарного GMV пользователя за 30 дней (**2026-02-14 … 2026-03-15**) по истории
-дневной активности. Метрика — RMSLE, 250 000 пользователей.
+Прогноз суммарного GMV пользователя за 30 дней (**2026-02-14 … 2026-03-15**)
+по дневной истории активности. Метрика — RMSLE, 250 000 пользователей,
+30.6 млн дневных записей.
 
-| Документ | О чём |
-| :--- | :--- |
-| [SOLUTION.md](SOLUTION.md) | текущее решение, результат на лидерборде, проверенные гипотезы |
-| [ANALYSIS.md](ANALYSIS.md) | выжимка анализа данных: три находки, метрика, признаки, причинность |
-| [notebooks/01_eda.ipynb](notebooks/01_eda.ipynb) | полный разведочный анализ, 40 графиков |
-| [notebooks/02_report.ipynb](notebooks/02_report.ipynb) | отчёт с выводами формул |
+---
+
+## Документация
+
+| Документ | Что внутри | Кому |
+| :--- | :--- | :--- |
+| **[SOLUTION.md](SOLUTION.md)** | математика и алгоритм: постановка, следствия метрики, двухчастная модель, калибровка уровня, признаки, ансамблирование | понять, **что** сделано и почему именно так |
+| **[TRAINING.md](TRAINING.md)** | инструменты, конфигурация, бюджет памяти, времена, ловушки, воспроизведение | **запустить** и получить сабмит |
+| **[EXPERIMENTS.md](EXPERIMENTS.md)** | журнал гипотез: сработало, не сработало, механизмы; что переносится между окнами | не заходить повторно в закрытые двери |
+| **[ANALYSIS.md](ANALYSIS.md)** | разведочный анализ данных: три находки, устройство метрики, причинные проверки | понять **данные** |
+| [notebooks/01_eda.ipynb](notebooks/01_eda.ipynb) | полный разведочный анализ, 40 графиков | |
+| [notebooks/02_report.ipynb](notebooks/02_report.ipynb) | отчёт с выводами формул | |
+
+---
 
 ## Установка
 
 ```bash
-conda env create -f environment.yml
-conda activate ecup
+conda env create -f environment.yml && conda activate ecup
 ```
 
-Либо в существующее окружение:
-
-```bash
-pip install -r requirements.txt
-# macOS: LightGBM без libomp не импортируется
-conda install -c conda-forge llvm-openmp   # или: brew install libomp
-```
+Либо в существующее окружение: `pip install -r requirements.txt`, плюс на macOS
+`conda install -c conda-forge llvm-openmp` — без `libomp` LightGBM не импортируется.
 
 ## Данные
 
-Положить в `data_start/`:
-
 ```text
 data_start/
-├── train.parquet        30 631 006 строк, 180 MB
+├── train.parquet        30 631 006 строк
 └── sample_submit.csv    250 000 строк
 ```
 
@@ -44,22 +45,30 @@ data_start/
 import sys; sys.path.insert(0, "src")
 from ecup import load_panel, run_validation, make_submission, SplitConfig
 
-df = load_panel()                                    # ~30 с в первый раз, потом мгновенно
-split = SplitConfig(max_history=300, n_train_anchors=6)
+df = load_panel()
+split = SplitConfig(max_history=300, n_train_anchors=6, with_state=True)
 
-run_validation(df=df, split=split)                   # ~4 мин
-make_submission(split=split, a_p=0.0, a_m=0.07)       # ~5 мин → artifacts/submission_v2.csv
+run_validation(df=df, split=split)                 # ~6 мин
+make_submission(split=split, a_p=0.0, a_m=0.18)    # ~7 мин
 ```
 
-Эксперименты:
+---
 
-```python
-from ecup import sweep_history, sweep_anchors
-sweep_history(history_grid=(90, 168, 240, 300, 365), n_train_anchors=4, df=df)
-sweep_anchors(anchor_grid=(1, 2, 4, 6, 9), max_history=300, df=df)
-```
+## Решение в двух абзацах
+
+Метрика RMSLE после замены $z = \log(1+y)$ становится обычным RMSE, поэтому модель
+обучается только в $\log$-пространстве, а оптимальный прогноз есть
+$\exp(\mathbb{E}[z\mid x]) - 1$. Так как $\log(1+0) = 0$, разложение
+$\mathbb{E}[z\mid x] = p(x)\,m(x)$ на вероятность покупки и условную сумму —
+**тождество**, а не приближение, и склейка $\hat y = e^{pm}-1$ точна.
+
+Обучающие примеры — пары «пользователь, якорь» с шагом 30 дней; на каждом якоре
+применяется восстановленное из данных правило отбора популяции. Уровень окна
+раскладывается как $\ell = \bar p \cdot \ell^{+}$, и каждая голова нормируется на
+свою маржу. Финальный прогноз — равновесное усреднение структурно разнообразных
+моделей в $z$-пространстве.
 
 ## Требования к машине
 
-Разрабатывалось на MacBook, 18 GB RAM, 11 ядер, без GPU. Панель после даункаста
-занимает 1.1 GB, обучение на 7 якорях (1.2 млн примеров × 116 признаков) — около 5 минут.
+Разрабатывалось на 18 GB RAM, 11 ядер, без GPU. Панель после даункаста занимает
+1.1 GB, пик при обучении 5–6 GB, полный цикл «валидация + сабмит» около 15 минут.
