@@ -14,6 +14,7 @@ polars==1.43.2            # вся работа с панелью 30.6 млн с
 pyarrow==24.0.0           # чтение parquet
 numpy==2.4.6
 lightgbm==4.7.0           # HurdleGBDT / DirectGBDT
+catboost==1.2.10          # HurdleCatBoost — второе семейство в ансамбле
 scikit-learn==1.9.0       # propensity score, матчинг, препроцессинг
 
 # --- анализ (notebooks/) -----------------------------------------------------
