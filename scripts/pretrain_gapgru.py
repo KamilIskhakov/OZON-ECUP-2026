@@ -66,6 +66,8 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--cycles", action="store_true",
+                    help="вторая шкала времени: токены покупочных циклов")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--cache", type=Path, default=Path("artifacts/neural/pretrain"))
     a = ap.parse_args()
@@ -75,7 +77,7 @@ def main() -> None:
     from torch import nn
     from ecup import SplitConfig, load_panel, selected_users
     from ecup.gapgru import GapGRUConfig, make_model, pick_device
-    from ecup.tokens import TOKEN_FEATURES, build_tokens
+    from ecup.tokens import TOKEN_FEATURES, build_tokens, cycle_tokens
 
     cuts = cutoffs_for(a.limit_anchor, a.earliest, a.step)
     print(f"срезов {len(cuts)}: {cuts[0]}…{cuts[-1]} шаг {a.step} · "
@@ -89,7 +91,8 @@ def main() -> None:
 
     store = []
     for c in cuts:
-        f = a.cache / f"cut_{c}_{a.max_len}_{a.users}.npz"
+        tag = "cyc" if a.cycles else "evt"
+        f = a.cache / f"cut_{c}_{a.max_len}_{a.users}_{tag}.npz"
         if not f.exists():
             t0 = time.perf_counter()
             u = selected_users(df, c).to_numpy()
@@ -101,13 +104,18 @@ def main() -> None:
                 u = u[keep]
             us = pl.Series("user_id", u)
             X, L = build_tokens(df, c, us, a.max_history, a.max_len)
-            np.savez(f, X=X, L=L, **targets_at(df, c, us))
+            extra = {}
+            if a.cycles:
+                C, _ = cycle_tokens(df, c, us, a.max_history)
+                extra["C"] = C.astype("float16")
+            np.savez(f, X=X, L=L, **extra, **targets_at(df, c, us))
             print(f"  срез {c}: {X.shape} · {time.perf_counter()-t0:.0f}с", flush=True)
             del X; gc.collect()
         store.append(f)
 
     cfg = GapGRUConfig(n_features=len(TOKEN_FEATURES) - 2, max_len=a.max_len,
-                       lr=a.lr, batch_size=a.batch_size, epochs=a.epochs, seed=a.seed)
+                       lr=a.lr, batch_size=a.batch_size, epochs=a.epochs,
+                       seed=a.seed, use_cycles=a.cycles)
     model = make_model(cfg).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     mse, bce = nn.MSELoss(), nn.BCEWithLogitsLoss()
@@ -137,8 +145,10 @@ def main() -> None:
                 prior = np.zeros((len(idx), 3), dtype="float32")
                 prior[:, 2] = np.log1p(L) - np.log1p(L_all).mean()
                 opt.zero_grad(set_to_none=True)
+                cy = T(np.asarray(d["C"][idx], dtype="float32")) if a.cycles else None
                 _, aux = model(T(np.delete(Xb, [gi, ai], axis=2)), T(Xb[:, :, gi]),
-                               T(Xb[:, :, ai]), T(m, torch.bool), T(prior))
+                               T(Xb[:, :, ai]), T(m, torch.bool), T(prior),
+                               cycles=cy)
                 loss = (mse(aux["z_abs"], T(z30[idx]))
                         + 0.3 * bce(aux["p"], T(d["c30"][idx]))
                         + 0.2 * mse(aux["n_buy"], T(d["nbuy30"][idx]))
