@@ -1,0 +1,219 @@
+"""Gap-GRU на остатке ансамбля: два временных фолда, критерий переносимости.
+
+Критерий успеха задан заранее и не подлежит пересмотру по факту: поправка
+принимается, только если z0 + α·Δz бьёт z0 на ОБОИХ фолдах. Плюс на одном
+и минус на другом означает шум, а не сигнал — на нём мы уже один раз
+обожглись, приняв за находку разницу 0.00003.
+
+Фолды сдвинуты по времени и не пересекаются целевыми окнами:
+
+    фолд 1: обучение 198…288 · подбор α на 318 · оценка на 348
+    фолд 2: обучение 198…318 · подбор α на 348 · оценка на 378
+
+α подбирается ОТДЕЛЬНО от сети и на отдельном якоре — той же параболой
+из двух точек, что закрыла долю CatBoost. Учить α вместе с zero-init
+головой бессмысленно: произведение α·Δz вырождено, сеть просто
+отмасштабирует Δz.
+"""
+from __future__ import annotations
+
+import argparse, gc, json, sys, time
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+TRAIN_ANCHORS = [198, 228, 258, 288, 318, 348]
+VAL_ANCHOR = 378
+FOLDS = [(TRAIN_ANCHORS[:4], 318, 348), (TRAIN_ANCHORS[:5], 348, VAL_ANCHOR)]
+
+
+def aux_targets(df, anchor, users, horizon=30):
+    """Вспомогательные цели: покупал ли, сколько дней с покупкой, сколько заказов.
+
+    Нужны не ради самих выходов, а чтобы представление описывало механизм
+    поведения. Главный таргет — остаток сильной модели — слишком шумный,
+    чтобы в одиночку учить энкодер.
+    """
+    import polars as pl
+    t = (df.filter(pl.col("d").is_between(anchor + 1, anchor + horizon))
+           .group_by("user_id")
+           .agg(n_buy=(pl.col("gmv") > 0).sum(), n_ord=pl.col("to_ord").sum()))
+    a = (pl.DataFrame({"user_id": users}).join(t, on="user_id", how="left")
+           .with_columns(pl.exclude("user_id").fill_null(0)))
+    return (np.log1p(a["n_buy"].to_numpy()).astype("float32"),
+            np.log1p(a["n_ord"].to_numpy()).astype("float32"))
+
+
+class AnchorData:
+    """Токены + базовый прогноз + цели одного якоря, выровненные по user_id."""
+
+    def __init__(self, anchor: int, tok_dir: Path, oof_dir: Path, df=None):
+        import polars as pl
+        meta = np.load(tok_dir / f"meta_a{anchor}.npz")
+        oof = np.load(oof_dir / f"oof_a{anchor}.npz")
+        tu, ou = meta["user_id"], oof["user_id"]
+        # пересечение и порядок: молчаливое расхождение здесь дало бы
+        # обучение на чужих остатках при формально корректном коде
+        common, ti, oi = np.intersect1d(tu, ou, return_indices=True)
+        self.anchor, self.user_id = anchor, common
+        self.rows = ti
+        self.X = np.load(tok_dir / f"x_a{anchor}.npy", mmap_mode="r")
+        self.lengths = meta["lengths"][ti]
+        self.z0 = oof["z0"][oi].astype("float32")
+        self.dis = (oof["z0_lgb"][oi] - oof["z0_cb"][oi]).astype("float32")
+        self.z = np.log1p(oof["y"][oi]).astype("float32")
+        self.c = (oof["y"][oi] > 0).astype("float32")
+        if df is not None:
+            self.n_buy, self.n_ord = aux_targets(df, anchor, pl.Series("user_id", common))
+        else:
+            self.n_buy = self.n_ord = np.zeros(len(common), dtype="float32")
+
+    def __len__(self):
+        return len(self.user_id)
+
+
+def batches(datasets, bs, rng, feat_idx, shuffle=True):
+    """Батчи вперемешку по якорям: сеть не должна видеть якорь как блок."""
+    index = [(di, i) for di, d in enumerate(datasets) for i in range(len(d))]
+    index = np.array(index, dtype=np.int64)
+    if shuffle:
+        rng.shuffle(index)
+    for s in range(0, len(index), bs):
+        chunk = index[s:s + bs]
+        out = []
+        for di in np.unique(chunk[:, 0]):
+            d = datasets[di]
+            loc = np.sort(chunk[chunk[:, 0] == di, 1])
+            X = np.asarray(d.X[d.rows[loc]], dtype="float32")
+            out.append((d, loc, X))
+        yield out, feat_idx
+
+
+def to_torch(parts, feat_idx, dev, max_len):
+    import torch
+    Xs, gaps, ages, masks, priors, zs, z0s, cs, nbs, nos = ([] for _ in range(10))
+    gi, ai = feat_idx
+    for d, loc, X in parts:
+        L = d.lengths[loc]
+        m = np.arange(max_len)[None, :] >= (max_len - np.minimum(L, max_len))[:, None]
+        Xs.append(np.delete(X, [gi, ai], axis=2)); gaps.append(X[:, :, gi])
+        ages.append(X[:, :, ai]); masks.append(m)
+        priors.append(np.stack([d.z0[loc] - d.z0.mean(), d.dis[loc],
+                                np.log1p(L) - np.log1p(d.lengths).mean()], 1))
+        zs.append(d.z[loc]); z0s.append(d.z0[loc]); cs.append(d.c[loc])
+        nbs.append(d.n_buy[loc]); nos.append(d.n_ord[loc])
+    T = lambda a, t=torch.float32: torch.as_tensor(np.concatenate(a), dtype=t, device=dev)
+    return (T(Xs), T(gaps), T(ages), T(masks, torch.bool), T(priors),
+            T(zs), T(z0s), T(cs), T(nbs), T(nos))
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tokens", type=Path, default=Path("artifacts/neural/tokens"))
+    ap.add_argument("--oof", type=Path, default=Path("artifacts/neural"))
+    ap.add_argument("--max-len", type=int, default=192)
+    ap.add_argument("--epochs", type=int, default=12)
+    ap.add_argument("--batch-size", type=int, default=512)
+    ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--lambda-delta", type=float, default=0.05)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--fold", type=int, default=-1, help="-1 = оба")
+    ap.add_argument("--out", type=Path, default=Path("artifacts/neural/gapgru.json"))
+    a = ap.parse_args()
+
+    import warnings; warnings.filterwarnings("ignore")
+    import torch
+    from torch import nn
+    from ecup import load_panel
+    from ecup.gapgru import GapGRUConfig, make_model, pick_device
+    from ecup.tokens import TOKEN_FEATURES
+
+    gi, ai = TOKEN_FEATURES.index("gap"), TOKEN_FEATURES.index("age")
+    dev = pick_device()
+    df = load_panel()
+    print(f"устройство {dev} · длина {a.max_len}", flush=True)
+
+    cache = {}
+    def get(anchor):
+        if anchor not in cache:
+            cache[anchor] = AnchorData(anchor, a.tokens, a.oof, df)
+            print(f"  якорь {anchor}: {len(cache[anchor]):,} пользователей", flush=True)
+        return cache[anchor]
+
+    results = []
+    folds = FOLDS if a.fold < 0 else [FOLDS[a.fold]]
+    for fi, (tr_anchors, alpha_anchor, test_anchor) in enumerate(folds):
+        print(f"\n=== фолд {fi}: обучение {tr_anchors} · α на {alpha_anchor} · "
+              f"оценка на {test_anchor} ===", flush=True)
+        tr = [get(x) for x in tr_anchors]
+        cfg = GapGRUConfig(n_features=len(TOKEN_FEATURES) - 2, max_len=a.max_len,
+                           lambda_delta=a.lambda_delta, lr=a.lr,
+                           batch_size=a.batch_size, epochs=a.epochs, seed=a.seed)
+        model = make_model(cfg).to(dev)
+        opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
+                                weight_decay=cfg.weight_decay)
+        n_steps = cfg.epochs * (sum(len(d) for d in tr) // cfg.batch_size + 1)
+        sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=cfg.lr,
+                                                    total_steps=n_steps)
+        bce, mse = nn.BCEWithLogitsLoss(), nn.MSELoss()
+        rng = np.random.default_rng(cfg.seed)
+
+        def predict(d):
+            model.eval(); out = []
+            with torch.no_grad():
+                for parts, fx in batches([d], 4096, rng, (gi, ai), shuffle=False):
+                    X, g, ag, m, pr, *_ = to_torch(parts, fx, dev, a.max_len)
+                    out.append(model(X, g, ag, m, pr)[0].float().cpu().numpy())
+            model.train()
+            return np.concatenate(out)
+
+        for ep in range(cfg.epochs):
+            t0, tot, nb = time.perf_counter(), 0.0, 0
+            for parts, fx in batches(tr, cfg.batch_size, rng, (gi, ai)):
+                X, g, ag, m, pr, z, z0, c, nbuy, nord = to_torch(parts, fx, dev, a.max_len)
+                opt.zero_grad(set_to_none=True)
+                dz, aux = model(X, g, ag, m, pr)
+                loss = mse(z0 + dz, z) + cfg.lambda_delta * (dz ** 2).mean()
+                loss = loss + cfg.aux_weights["p"] * bce(aux["p"], c)
+                loss = loss + cfg.aux_weights["n_buy"] * mse(aux["n_buy"], nbuy)
+                loss = loss + cfg.aux_weights["n_ord"] * mse(aux["n_ord"], nord)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step(); sched.step()
+                tot += float(loss.item()); nb += 1
+            print(f"  эпоха {ep+1}/{cfg.epochs}  loss {tot/max(nb,1):.5f}  "
+                  f"{time.perf_counter()-t0:.0f}с", flush=True)
+
+        # α на отдельном якоре: парабола MSE(α) = MSE(0) - 2αC + α²D
+        da = get(alpha_anchor); dz_a = predict(da)
+        e = da.z - da.z0
+        D = float((dz_a ** 2).mean()); C = float((e * dz_a).mean())
+        alpha = C / max(D, 1e-12)
+        dt = get(test_anchor); dz_t = predict(dt)
+        base = float((dt.z - dt.z0).std())
+        got = float((dt.z - dt.z0 - alpha * dz_t).std())
+        row = dict(fold=fi, alpha=alpha, D=D, C=C, shape_base=base,
+                   shape_corrected=got, gain=base - got,
+                   alpha_anchor_gain=float((e).std() - (e - alpha * dz_a).std()),
+                   std_dz=float(dz_t.std()))
+        print(f"  α = {alpha:+.4f} · std(Δz) = {row['std_dz']:.4f}\n"
+              f"  на {test_anchor}: {base:.5f} → {got:.5f}  "
+              f"выигрыш {row['gain']:+.5f}", flush=True)
+        results.append(row)
+        del model; gc.collect()
+
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    a.out.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    print("\n=== итог ===")
+    for r in results:
+        print(f"  фолд {r['fold']}: выигрыш {r['gain']:+.5f} (α={r['alpha']:+.4f})")
+    ok = all(r["gain"] > 0.0002 for r in results)
+    print(f"  критерий (плюс на ОБОИХ фолдах, > 0.0002): "
+          f"{'ПРОЙДЕН' if ok else 'не пройден'}")
+    print("ГОТОВО")
+
+
+if __name__ == "__main__":
+    main()

@@ -19,3 +19,5 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+artifacts/neural/tokens/
+artifacts/neural/*.npz
