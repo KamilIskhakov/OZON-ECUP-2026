@@ -111,11 +111,19 @@ class SplitConfig:
         return max(self.max_history, SELECTION_SPAN) - 1
 
     def train_anchors(self) -> list[int]:
-        """Обучающие якоря — назад от валидационного с шагом stride."""
+        """Обучающие якоря — назад от валидационного с шагом stride.
+
+        Отступ первого якоря равен НЕ шагу, а максимуму из шага и горизонта.
+        Якорь $a$ обучается на целевом окне $[a+1, a+H]$, и при $a > V - H$ это
+        окно пересекается с валидационным $[V+1, V+H]$ — модель увидела бы часть
+        того, что ей предстоит предсказать. При stride = H = 30 оба выражения
+        совпадают, поэтому раньше расхождение не проявлялось; оно возникает
+        ровно при попытке уплотнить якоря.
+        """
         earliest = self.earliest_anchor()
         limit = self.n_train_anchors if self.n_train_anchors is not None else 10**9
         out: list[int] = []
-        a = self.val_anchor - self.stride
+        a = self.val_anchor - max(self.stride, self.horizon)
         while a >= earliest and len(out) < limit:
             out.append(a)
             a -= self.stride

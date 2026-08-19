@@ -37,9 +37,9 @@ class HurdleGBDT:
         sample_weight: np.ndarray | None = None,
         z_offset: np.ndarray | None = None,
         clf_init: np.ndarray | None = None,
-        early_stopping_rounds: int | None = None,
-        eval_frac: float = 0.12,
-        refit_full: bool = False,
+        early_stopping_rounds: int | None = -1,
+        eval_frac: float | None = None,
+        refit_full: bool | None = None,
     ) -> "HurdleGBDT":
         """Обучить обе головы, каждую со своим офсетом якоря.
 
@@ -50,6 +50,15 @@ class HurdleGBDT:
         обучается только на y>0, а ℓ = p̄·ℓ⁺ почти целиком описывает
         экстенсивную маржу и внёс бы в цель посторонний уровневый шум.
         """
+        # Значения по умолчанию берутся из конфига, а не из сигнатуры: иначе
+        # вызов без явного аргумента молча отключает раннюю остановку, и модель
+        # обучается до упора в n_estimators. Ровно на этом уже был испорчен
+        # замер — LightGBM сравнивался с CatBoost без ранней остановки.
+        if early_stopping_rounds == -1:
+            early_stopping_rounds = self.config.early_stopping_rounds
+        eval_frac = self.config.eval_frac if eval_frac is None else eval_frac
+        refit_full = self.config.refit_full if refit_full is None else refit_full
+
         y = np.asarray(y, dtype="float64")
         pos = y > 0
         self.feature_names = feature_names or self.feature_names
