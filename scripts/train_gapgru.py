@@ -120,6 +120,11 @@ def main() -> None:
     ap.add_argument("--lambda-delta", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--fold", type=int, default=-1, help="-1 = оба")
+    ap.add_argument("--init-from", type=Path, default=None,
+                    help="чекпоинт этапа A; ищется как <путь>_fold{i}.pt")
+    ap.add_argument("--freeze-epochs", type=int, default=2,
+                    help="эпох с замороженным энкодером после претрейна")
+    ap.add_argument("--ckpt", type=Path, default=None)
     ap.add_argument("--out", type=Path, default=Path("artifacts/neural/gapgru.json"))
     a = ap.parse_args()
 
@@ -152,6 +157,18 @@ def main() -> None:
                            lambda_delta=a.lambda_delta, lr=a.lr,
                            batch_size=a.batch_size, epochs=a.epochs, seed=a.seed)
         model = make_model(cfg).to(dev)
+        if a.init_from is not None:
+            src = Path(f"{a.init_from}_fold{fi}.pt")
+            if not src.exists():
+                raise FileNotFoundError(f"нет чекпоинта этапа A: {src}")
+            sd = torch.load(src, map_location=dev)["model"]
+            missing, unexpected = model.load_state_dict(sd, strict=False)
+            print(f"  претрейн загружен из {src.name}"
+                  + (f" (не найдено: {len(missing)})" if missing else ""), flush=True)
+        # Голова поправки должна стартовать с нуля даже после претрейна:
+        # иначе первый же шаг сдвинет прогноз, не объяснив ошибку.
+        nn.init.zeros_(model.head_dz.weight); nn.init.zeros_(model.head_dz.bias)
+        enc = [p_ for n_, p_ in model.named_parameters() if not n_.startswith(("trunk", "head_dz"))]
         opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                 weight_decay=cfg.weight_decay)
         n_steps = cfg.epochs * (sum(len(d) for d in tr) // cfg.batch_size + 1)
@@ -170,6 +187,12 @@ def main() -> None:
             return np.concatenate(out)
 
         for ep in range(cfg.epochs):
+            # Энкодер после претрейна сначала заморожен: остаток очень шумный,
+            # и разморозка с первого шага стёрла бы выученное поведение
+            # градиентами по шуму.
+            frozen = a.init_from is not None and ep < a.freeze_epochs
+            for p_ in enc:
+                p_.requires_grad_(not frozen)
             t0, tot, nb = time.perf_counter(), 0.0, 0
             for parts, fx in batches(tr, cfg.batch_size, rng, (gi, ai)):
                 X, g, ag, m, pr, z, z0, c, nbuy, nord = to_torch(parts, fx, dev, a.max_len)
@@ -183,8 +206,13 @@ def main() -> None:
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step(); sched.step()
                 tot += float(loss.item()); nb += 1
-            print(f"  эпоха {ep+1}/{cfg.epochs}  loss {tot/max(nb,1):.5f}  "
+            print(f"  эпоха {ep+1}/{cfg.epochs}  loss {tot/max(nb,1):.5f}"
+                  f"{'  [энкодер заморожен]' if frozen else ''}  "
                   f"{time.perf_counter()-t0:.0f}с", flush=True)
+            if a.ckpt is not None:
+                a.ckpt.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({"model": model.state_dict(), "fold": fi, "epoch": ep + 1},
+                           Path(f"{a.ckpt}_fold{fi}.pt"))
 
         # α на отдельном якоре: парабола MSE(α) = MSE(0) - 2αC + α²D
         da = get(alpha_anchor); dz_a = predict(da)
@@ -198,9 +226,15 @@ def main() -> None:
                    shape_corrected=got, gain=base - got,
                    alpha_anchor_gain=float((e).std() - (e - alpha * dz_a).std()),
                    std_dz=float(dz_t.std()))
+        # Разрыв между выигрышем на якоре подбора и на тестовом — прямая мера
+        # переносимости. Большой выигрыш на первом при нуле на втором означает,
+        # что α описал особенность одного окна, а не общий сигнал.
         print(f"  α = {alpha:+.4f} · std(Δz) = {row['std_dz']:.4f}\n"
-              f"  на {test_anchor}: {base:.5f} → {got:.5f}  "
-              f"выигрыш {row['gain']:+.5f}", flush=True)
+              f"  на {alpha_anchor} (подбор α): выигрыш {row['alpha_anchor_gain']:+.5f}\n"
+              f"  на {test_anchor} (оценка):   {base:.5f} → {got:.5f}  "
+              f"выигрыш {row['gain']:+.5f}\n"
+              f"  перенос: {100 * row['gain'] / max(row['alpha_anchor_gain'], 1e-9):.0f}% "
+              f"выигрыша якоря подбора", flush=True)
         results.append(row)
         del model; gc.collect()
 
