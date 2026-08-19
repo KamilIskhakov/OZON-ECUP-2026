@@ -21,3 +21,8 @@ __pycache__/
 .idea/
 artifacts/neural/tokens/
 artifacts/neural/*.npz
+
+# секреты
+.env
+.env.*
+!.env.example
