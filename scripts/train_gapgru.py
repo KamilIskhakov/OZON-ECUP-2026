@@ -49,7 +49,8 @@ def aux_targets(df, anchor, users, horizon=30):
 class AnchorData:
     """Токены + базовый прогноз + цели одного якоря, выровненные по user_id."""
 
-    def __init__(self, anchor: int, tok_dir: Path, oof_dir: Path, df=None):
+    def __init__(self, anchor: int, tok_dir: Path, oof_dir: Path, df=None,
+                 need_cycles: bool = False):
         import polars as pl
         meta = np.load(tok_dir / f"meta_a{anchor}.npz")
         oof = np.load(oof_dir / f"oof_a{anchor}.npz")
@@ -60,6 +61,12 @@ class AnchorData:
         self.anchor, self.user_id = anchor, common
         self.rows = ti
         self.X = np.load(tok_dir / f"x_a{anchor}.npy", mmap_mode="r")
+        cf = tok_dir / f"c_a{anchor}.npy"
+        if need_cycles and not cf.exists():
+            raise FileNotFoundError(
+                f"нет токенов циклов {cf}; пересоберите: "
+                f"python scripts/build_tokens.py --cycles")
+        self.C = np.load(cf, mmap_mode="r") if cf.exists() else None
         self.lengths = meta["lengths"][ti]
         self.z0 = oof["z0"][oi].astype("float32")
         self.dis = (oof["z0_lgb"][oi] - oof["z0_cb"][oi]).astype("float32")
@@ -74,7 +81,7 @@ class AnchorData:
         return len(self.user_id)
 
 
-def batches(datasets, bs, rng, feat_idx, shuffle=True):
+def batches(datasets, bs, rng, feat_idx, shuffle=True, max_len=None):
     """Батчи вперемешку по якорям: сеть не должна видеть якорь как блок."""
     index = [(di, i) for di, d in enumerate(datasets) for i in range(len(d))]
     index = np.array(index, dtype=np.int64)
@@ -87,15 +94,20 @@ def batches(datasets, bs, rng, feat_idx, shuffle=True):
             d = datasets[di]
             loc = np.sort(chunk[chunk[:, 0] == di, 1])
             X = np.asarray(d.X[d.rows[loc]], dtype="float32")
-            out.append((d, loc, X))
+            if max_len is not None and X.shape[1] > max_len:
+                X = X[:, -max_len:]          # правый край = ближайшее к якорю
+            C = None if d.C is None else np.asarray(d.C[d.rows[loc]], dtype="float32")
+            out.append((d, loc, X, C))
         yield out, feat_idx
 
 
 def to_torch(parts, feat_idx, dev, max_len):
     import torch
-    Xs, gaps, ages, masks, priors, zs, z0s, cs, nbs, nos = ([] for _ in range(10))
+    Xs, gaps, ages, masks, priors, zs, z0s, cs, nbs, nos, cyc = ([] for _ in range(11))
     gi, ai = feat_idx
-    for d, loc, X in parts:
+    for d, loc, X, C in parts:
+        if C is not None:
+            cyc.append(C)
         L = d.lengths[loc]
         m = np.arange(max_len)[None, :] >= (max_len - np.minimum(L, max_len))[:, None]
         Xs.append(np.delete(X, [gi, ai], axis=2)); gaps.append(X[:, :, gi])
@@ -106,7 +118,8 @@ def to_torch(parts, feat_idx, dev, max_len):
         nbs.append(d.n_buy[loc]); nos.append(d.n_ord[loc])
     T = lambda a, t=torch.float32: torch.as_tensor(np.concatenate(a), dtype=t, device=dev)
     return (T(Xs), T(gaps), T(ages), T(masks, torch.bool), T(priors),
-            T(zs), T(z0s), T(cs), T(nbs), T(nos))
+            T(zs), T(z0s), T(cs), T(nbs), T(nos),
+            T(cyc) if cyc else None)
 
 
 def main() -> None:
@@ -125,6 +138,8 @@ def main() -> None:
     ap.add_argument("--freeze-epochs", type=int, default=2,
                     help="эпох с замороженным энкодером после претрейна")
     ap.add_argument("--ckpt", type=Path, default=None)
+    ap.add_argument("--cycles", action="store_true",
+                    help="включить вторую шкалу времени: токены покупочных циклов")
     ap.add_argument("--out", type=Path, default=Path("artifacts/neural/gapgru.json"))
     a = ap.parse_args()
 
@@ -143,7 +158,8 @@ def main() -> None:
     cache = {}
     def get(anchor):
         if anchor not in cache:
-            cache[anchor] = AnchorData(anchor, a.tokens, a.oof, df)
+            cache[anchor] = AnchorData(anchor, a.tokens, a.oof, df,
+                                       need_cycles=a.cycles)
             print(f"  якорь {anchor}: {len(cache[anchor]):,} пользователей", flush=True)
         return cache[anchor]
 
@@ -155,7 +171,8 @@ def main() -> None:
         tr = [get(x) for x in tr_anchors]
         cfg = GapGRUConfig(n_features=len(TOKEN_FEATURES) - 2, max_len=a.max_len,
                            lambda_delta=a.lambda_delta, lr=a.lr,
-                           batch_size=a.batch_size, epochs=a.epochs, seed=a.seed)
+                           batch_size=a.batch_size, epochs=a.epochs, seed=a.seed,
+                           use_cycles=a.cycles)
         model = make_model(cfg).to(dev)
         if a.init_from is not None:
             src = Path(f"{a.init_from}_fold{fi}.pt")
@@ -180,9 +197,12 @@ def main() -> None:
         def predict(d):
             model.eval(); out = []
             with torch.no_grad():
-                for parts, fx in batches([d], 4096, rng, (gi, ai), shuffle=False):
-                    X, g, ag, m, pr, *_ = to_torch(parts, fx, dev, a.max_len)
-                    out.append(model(X, g, ag, m, pr)[0].float().cpu().numpy())
+                for parts, fx in batches([d], 4096, rng, (gi, ai), shuffle=False,
+                                         max_len=a.max_len):
+                    X, g, ag, m, pr, *_, cy = to_torch(parts, fx, dev, a.max_len)
+                    out.append(model(X, g, ag, m, pr,
+                                     cycles=cy if a.cycles else None)[0]
+                               .float().cpu().numpy())
             model.train()
             return np.concatenate(out)
 
@@ -194,10 +214,12 @@ def main() -> None:
             for p_ in enc:
                 p_.requires_grad_(not frozen)
             t0, tot, nb = time.perf_counter(), 0.0, 0
-            for parts, fx in batches(tr, cfg.batch_size, rng, (gi, ai)):
-                X, g, ag, m, pr, z, z0, c, nbuy, nord = to_torch(parts, fx, dev, a.max_len)
+            for parts, fx in batches(tr, cfg.batch_size, rng, (gi, ai),
+                                     max_len=a.max_len):
+                X, g, ag, m, pr, z, z0, c, nbuy, nord, cy = to_torch(
+                    parts, fx, dev, a.max_len)
                 opt.zero_grad(set_to_none=True)
-                dz, aux = model(X, g, ag, m, pr)
+                dz, aux = model(X, g, ag, m, pr, cycles=cy if a.cycles else None)
                 loss = mse(z0 + dz, z) + cfg.lambda_delta * (dz ** 2).mean()
                 loss = loss + cfg.aux_weights["p"] * bce(aux["p"], c)
                 loss = loss + cfg.aux_weights["n_buy"] * mse(aux["n_buy"], nbuy)
