@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import torch  # noqa: F401  (нужен для Parameter в make_model)
+
 import numpy as np
 
 
@@ -44,6 +46,18 @@ class GapGRUConfig:
     n_layers: int = 2
     n_heads: int = 4
     d_head: int = 32
+    # Обучаемые запросы по поведенческим факторам вместо одного пулинга.
+    # Разложение взято из BTYD, но параметры не постулируются: сеть сама
+    # решает, какие эпизоды нужны для оценки частоты, а какие — для чека.
+    # Один запрос вынужден одним вектором обслуживать все головы сразу;
+    # четыре специализируются.
+    queries: tuple[str, ...] = ("freq", "amount", "intent", "activity")
+    # Ветка покупочных циклов: маленький трансформер по 16 токенам.
+    use_cycles: bool = False
+    n_cycle_features: int = 8
+    max_cycles: int = 16
+    cycle_dim: int = 64
+    cycle_layers: int = 2
     mlp: tuple[int, ...] = (128, 64)
     dropout: float = 0.1
     # Штраф на величину поправки: если в последовательности нет убедительного
@@ -103,14 +117,35 @@ def make_model(cfg: GapGRUConfig):
                 [GapGRULayer(dims[i], dims[i + 1]) for i in range(cfg.n_layers)])
             self.norm = nn.LayerNorm(cfg.hidden)
             dh = cfg.n_heads * cfg.d_head
-            # запрос строится из текущего состояния И из прогноза ансамбля:
-            # «что в прошлом релевантно тому, что модель предсказывает сейчас»
+            self.nq = len(cfg.queries)
+            # Каждый запрос — свой обучаемый вектор ПЛЮС проекция текущего
+            # состояния и прогноза ансамбля: «что в прошлом релевантно этому
+            # фактору при том, что модель предсказывает сейчас».
+            self.q_emb = nn.Parameter(torch.zeros(self.nq, cfg.hidden + 3))
+            nn.init.normal_(self.q_emb, std=0.02)
             self.q = nn.Linear(cfg.hidden + 3, dh)
             self.k = nn.Linear(cfg.hidden, dh)
             self.v = nn.Linear(cfg.hidden, dh)
             self.age_bias = nn.Sequential(nn.Linear(1, 16), nn.GELU(),
                                           nn.Linear(16, cfg.n_heads))
-            layers, d = [], cfg.hidden + dh + 3
+            self.cyc = None
+            d_cyc = 0
+            if cfg.use_cycles:
+                # Циклы — вторая шкала времени. Дневная ветка отвечает
+                # «что происходит сейчас», циклическая — «как обычно устроен
+                # ритм этого пользователя». Последовательности 8,9,8,10,27
+                # и 12,11,10,11,10 имеют близкую медиану интервала и разную
+                # динамику; агрегаты эту разницу стирают.
+                self.cyc_in = nn.Sequential(
+                    nn.Linear(cfg.n_cycle_features, cfg.cycle_dim), nn.GELU())
+                self.cyc_pos = nn.Parameter(torch.zeros(cfg.max_cycles, cfg.cycle_dim))
+                nn.init.normal_(self.cyc_pos, std=0.02)
+                enc = nn.TransformerEncoderLayer(
+                    cfg.cycle_dim, nhead=4, dim_feedforward=cfg.cycle_dim * 2,
+                    dropout=cfg.dropout, batch_first=True, norm_first=True)
+                self.cyc = nn.TransformerEncoder(enc, cfg.cycle_layers)
+                d_cyc = cfg.cycle_dim
+            layers, d = [], cfg.hidden + dh * self.nq + d_cyc + 3
             for w in cfg.mlp:
                 layers += [nn.Linear(d, w), nn.GELU(), nn.Dropout(cfg.dropout)]
                 d = w
@@ -119,23 +154,31 @@ def make_model(cfg: GapGRUConfig):
             nn.init.zeros_(self.head_dz.weight); nn.init.zeros_(self.head_dz.bias)
             self.aux = nn.ModuleDict({k: nn.Linear(d, 1) for k in cfg.aux_weights})
 
-        def forward(self, x, gap, age, mask, prior):
-            """prior = (logit p0, m0, z0), нормированные снаружи."""
+        def forward(self, x, gap, age, mask, prior, cycles=None):
+            """prior — (z0, расхождение семейств, длина), нормированные снаружи."""
             h = self.inp(x)
             for layer in self.layers:
                 h = layer(h, gap, mask)
             H = self.norm(h)                                    # (B, L, Hd)
             h_n = H[:, -1]                                      # правый край = якорь
             B, L, _ = H.shape
-            q = self.q(torch.cat([h_n, prior], -1)).view(B, cfg.n_heads, cfg.d_head)
+            base = torch.cat([h_n, prior], -1).unsqueeze(1)     # (B, 1, Hd+3)
+            q = self.q(base + self.q_emb.unsqueeze(0))          # (B, nq, dh)
+            q = q.view(B, self.nq, cfg.n_heads, cfg.d_head)
             k = self.k(H).view(B, L, cfg.n_heads, cfg.d_head)
             v = self.v(H).view(B, L, cfg.n_heads, cfg.d_head)
-            s = torch.einsum('bhd,blhd->bhl', q, k) / (cfg.d_head ** 0.5)
-            s = s + self.age_bias(age.unsqueeze(-1)).permute(0, 2, 1)
-            s = s.masked_fill(~mask.unsqueeze(1), float('-inf'))
+            s = torch.einsum('bqhd,blhd->bqhl', q, k) / (cfg.d_head ** 0.5)
+            s = s + self.age_bias(age.unsqueeze(-1)).permute(0, 2, 1).unsqueeze(1)
+            s = s.masked_fill(~mask[:, None, None, :], float('-inf'))
             a = torch.softmax(s, dim=-1)
-            c = torch.einsum('bhl,blhd->bhd', a, v).reshape(B, -1)
-            z = self.trunk(torch.cat([h_n, c, prior], -1))
+            c = torch.einsum('bqhl,blhd->bqhd', a, v).reshape(B, -1)
+            feats = [h_n, c, prior]
+            if self.cyc is not None:
+                if cycles is None:
+                    raise ValueError("модель собрана с use_cycles, но циклы не поданы")
+                hc = self.cyc(self.cyc_in(cycles) + self.cyc_pos.unsqueeze(0))
+                feats.insert(2, hc[:, -1])                      # последний цикл = ближайший
+            z = self.trunk(torch.cat(feats, -1))
             dz = self.head_dz(z).squeeze(-1)
             return dz, {k: head(z).squeeze(-1) for k, head in self.aux.items()}
 
