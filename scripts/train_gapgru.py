@@ -116,24 +116,48 @@ class AnchorData:
         return len(self.user_id)
 
 
-def batches(datasets, bs, rng, feat_idx, shuffle=True, max_len=None):
-    """Батчи вперемешку по якорям: сеть не должна видеть якорь как блок."""
-    index = [(di, i) for di, d in enumerate(datasets) for i in range(len(d))]
-    index = np.array(index, dtype=np.int64)
+def _load(d, loc, max_len):
+    X = np.asarray(d.X[d.rows[loc]], dtype="float32")
+    if max_len is not None and X.shape[1] > max_len:
+        X = X[:, -max_len:]                  # правый край = ближайшее к якорю
+    C = None if d.C is None else np.asarray(d.C[d.rows[loc]], dtype="float32")
+    return (d, loc, X, C)
+
+
+def batches(datasets, bs, rng, feat_idx, shuffle=True, max_len=None,
+            homogeneous=False):
+    """Батчи по якорям.
+
+    По умолчанию якоря перемешаны: сеть не должна видеть якорь как блок.
+
+    При `homogeneous=True` каждый батч целиком из одного якоря. Это нужно
+    направленному лоссу: Cov(e,d)/sqrt(Var(d)) — статистика уровня батча,
+    и при смешанном батче на якорь приходится ~450 строк из 2048, отчего
+    оценка ковариации шумная. Однородный батч даёт полные 2048 и заодно
+    снимает вопрос центрирования: центрирование по батчу становится
+    центрированием по якорю по построению.
+    """
+    if homogeneous:
+        chunks = []
+        for di, d in enumerate(datasets):
+            idx = np.arange(len(d))
+            if shuffle:
+                rng.shuffle(idx)
+            chunks += [(di, np.sort(idx[s:s + bs])) for s in range(0, len(idx), bs)]
+        if shuffle:
+            rng.shuffle(chunks)
+        for di, loc in chunks:
+            yield [_load(datasets[di], loc, max_len)], feat_idx
+        return
+
+    index = np.array([(di, i) for di, d in enumerate(datasets) for i in range(len(d))],
+                     dtype=np.int64)
     if shuffle:
         rng.shuffle(index)
     for s in range(0, len(index), bs):
         chunk = index[s:s + bs]
-        out = []
-        for di in np.unique(chunk[:, 0]):
-            d = datasets[di]
-            loc = np.sort(chunk[chunk[:, 0] == di, 1])
-            X = np.asarray(d.X[d.rows[loc]], dtype="float32")
-            if max_len is not None and X.shape[1] > max_len:
-                X = X[:, -max_len:]          # правый край = ближайшее к якорю
-            C = None if d.C is None else np.asarray(d.C[d.rows[loc]], dtype="float32")
-            out.append((d, loc, X, C))
-        yield out, feat_idx
+        yield ([_load(datasets[di], np.sort(chunk[chunk[:, 0] == di, 1]), max_len)
+                for di in np.unique(chunk[:, 0])], feat_idx)
 
 
 def to_torch(parts, feat_idx, dev, max_len):
@@ -177,6 +201,8 @@ def main() -> None:
     ap.add_argument("--ckpt", type=Path, default=None)
     ap.add_argument("--loss", choices=("mse", "dir"), default="mse",
                     help="mse — residual-MSE; dir — направленный Cov/sqrt(Var)")
+    ap.add_argument("--accum", type=int, default=4,
+                    help="однородных батчей на один шаг оптимизатора")
     ap.add_argument("--lambda-mse", type=float, default=0.1,
                     help="вес слабого residual-MSE при --loss dir")
     ap.add_argument("--production", action="store_true",
@@ -283,6 +309,15 @@ def main() -> None:
         da_early = None if a.production else get(alpha_anchor)
         best = {"gain": -1.0, "epoch": 0, "state": None}
         curve = []
+        # Устойчивая часть направления повторяется между соседними
+        # чекпоинтами, идиосинкратический шум — нет. Поэтому копим
+        # НОРМИРОВАННЫЕ направления и усредняем: масштаб каждого произволен,
+        # его всё равно поглотит α. Один подобранный скаляр на всё,
+        # в отличие от стекинга с весом на каждого участника.
+        acc_a, acc_t, n_acc = None, None, 0
+        # В боевом режиме тестового якоря нет по построению — там нечего
+        # оценивать, и попытка загрузить его токены даёт meta_aNone.npz.
+        dt_test = None if a.production else get(test_anchor)
 
         for ep in range(cfg.epochs):
             # Энкодер после претрейна сначала заморожен: остаток очень шумный,
@@ -292,11 +327,14 @@ def main() -> None:
             for p_ in enc:
                 p_.requires_grad_(not frozen)
             t0, tot, nb = time.perf_counter(), 0.0, 0
+            step = 0
             for parts, fx in batches(tr, cfg.batch_size, rng, (gi, ai),
-                                     max_len=a.max_len):
+                                     max_len=a.max_len,
+                                     homogeneous=(a.loss == "dir")):
                 X, g, ag, m, pr, z, z0, c, nbuy, nord, cy, grp, ngrp = to_torch(
                     parts, fx, dev, a.max_len)
-                opt.zero_grad(set_to_none=True)
+                if a.loss != "dir":
+                    opt.zero_grad(set_to_none=True)
                 dz, aux = model(X, g, ag, m, pr, cycles=cy if a.cycles else None)
                 if a.loss == "dir":
                     # штраф на масштаб здесь не нужен и вреден: целевая
@@ -308,9 +346,16 @@ def main() -> None:
                 loss = loss + cfg.aux_weights["p"] * bce(aux["p"], c)
                 loss = loss + cfg.aux_weights["n_buy"] * mse(aux["n_buy"], nbuy)
                 loss = loss + cfg.aux_weights["n_ord"] * mse(aux["n_ord"], nord)
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step(); sched.step()
+                # Однородные батчи делают каждый шаг видящим один якорь.
+                # Чтобы градиент не гулял вслед за идиосинкразией окна,
+                # накапливаем несколько якорей на один шаг оптимизатора.
+                acc = a.accum if a.loss == "dir" else 1
+                (loss / acc).backward()
+                step += 1
+                if step % acc == 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step(); sched.step()
+                    opt.zero_grad(set_to_none=True)
                 tot += float(loss.item()); nb += 1
             if tb is not None:
                 tb.add_scalar("loss/train", tot / max(nb, 1), ep + 1)
@@ -336,6 +381,12 @@ def main() -> None:
                     tb.add_histogram("holdout/dz", dz_e, ep + 1)
                 print(f"    якорь {alpha_anchor}: выигрыш {g:+.5f} · α {al:+.4f} · "
                       f"std(Δz) {dz_e.std():.4f}", flush=True)
+                nz = (dz_e - dz_e.mean()) / max(dz_e.std(), 1e-9)
+                acc_a = nz if acc_a is None else acc_a + nz
+                nzt = predict(dt_test)
+                nzt = (nzt - nzt.mean()) / max(nzt.std(), 1e-9)
+                acc_t = nzt if acc_t is None else acc_t + nzt
+                n_acc += 1
                 if g > best["gain"]:
                     best = {"gain": g, "epoch": ep + 1,
                             "state": {k: v.detach().cpu().clone()
@@ -373,11 +424,23 @@ def main() -> None:
         e = da.z - da.z0
         D = float((dz_a ** 2).mean()); C = float((e * dz_a).mean())
         alpha = C / max(D, 1e-12)
-        dt = get(test_anchor); dz_t = predict(dt)
+        dt = dt_test; dz_t = predict(dt)
         base = float((dt.z - dt.z0).std())
         got = float((dt.z - dt.z0 - alpha * dz_t).std())
+
+        # То же самое, но по усреднённому направлению чекпоинтов
+        ens_gain = None
+        if n_acc > 1:
+            da_e, dt_e = acc_a / n_acc, acc_t / n_acc
+            De = float((da_e ** 2).mean())
+            al_e = float((e * da_e).mean()) / max(De, 1e-12)
+            ens_gain = base - float((dt.z - dt.z0 - al_e * dt_e).std())
+            print(f"  усреднение {n_acc} чекпоинтов: α {al_e:+.4f} · "
+                  f"выигрыш {ens_gain:+.5f} против {base - got:+.5f} "
+                  f"у одиночного", flush=True)
         row = dict(fold=fi, alpha=alpha, D=D, C=C, shape_base=base,
                    best_epoch=best["epoch"], curve=curve,
+                   gain_ckpt_ens=ens_gain, n_ckpt=n_acc,
                    shape_corrected=got, gain=base - got,
                    alpha_anchor_gain=float((e).std() - (e - alpha * dz_a).std()),
                    std_dz=float(dz_t.std()))
