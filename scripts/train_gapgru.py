@@ -138,6 +138,9 @@ def main() -> None:
     ap.add_argument("--freeze-epochs", type=int, default=2,
                     help="эпох с замороженным энкодером после претрейна")
     ap.add_argument("--ckpt", type=Path, default=None)
+    ap.add_argument("--production", action="store_true",
+                    help="обучать на ВСЕХ якорях включая 348 и 378, без оценки; "
+                         "число эпох и alpha берутся из проверенного фолдового прогона")
     ap.add_argument("--tb", type=Path, default=None,
                     help="каталог логов TensorBoard")
     ap.add_argument("--eval-every", type=int, default=2,
@@ -178,10 +181,20 @@ def main() -> None:
         return cache[anchor]
 
     results = []
-    folds = FOLDS if a.fold < 0 else [FOLDS[a.fold]]
+    # Боевой режим: якоря 348 и 378 в фолдовой схеме тратятся на подбор α
+    # и на оценку, то есть два самых свежих окна не участвуют в обучении.
+    # Для прогноза на 408 это чистая потеря. Число эпох и α сюда переносятся
+    # из фолдового прогона — подбирать их здесь не на чем, и это осознанное
+    # ограничение режима, а не упущение.
+    folds = ([(TRAIN_ANCHORS + [VAL_ANCHOR], None, None)] if a.production
+             else FOLDS if a.fold < 0 else [FOLDS[a.fold]])
     for fi, (tr_anchors, alpha_anchor, test_anchor) in enumerate(folds):
-        print(f"\n=== фолд {fi}: обучение {tr_anchors} · α на {alpha_anchor} · "
-              f"оценка на {test_anchor} ===", flush=True)
+        if a.production:
+            print(f"\n=== боевой режим: обучение {tr_anchors}, оценки нет ===",
+                  flush=True)
+        else:
+            print(f"\n=== фолд {fi}: обучение {tr_anchors} · α на {alpha_anchor} · "
+                  f"оценка на {test_anchor} ===", flush=True)
         tr = [get(x) for x in tr_anchors]
         cfg = GapGRUConfig(n_features=len(TOKEN_FEATURES) - 2, max_len=a.max_len,
                            lambda_delta=a.lambda_delta, lr=a.lr,
@@ -225,7 +238,7 @@ def main() -> None:
         # подбора одного скаляра, поэтому выбор эпохи по нему согласован
         # и не трогает тестовый якорь. Без этой кривой число эпох остаётся
         # прикидкой — ровно той ошибкой, что была с числом деревьев.
-        da_early = get(alpha_anchor)
+        da_early = None if a.production else get(alpha_anchor)
         best = {"gain": -1.0, "epoch": 0, "state": None}
         curve = []
 
@@ -258,7 +271,8 @@ def main() -> None:
             print(f"  эпоха {ep+1}/{cfg.epochs}  loss {tot/max(nb,1):.5f}"
                   f"{'  [энкодер заморожен]' if frozen else ''}  "
                   f"{time.perf_counter()-t0:.0f}с", flush=True)
-            if (ep + 1) % a.eval_every == 0 or ep == cfg.epochs - 1:
+            if da_early is not None and ((ep + 1) % a.eval_every == 0
+                                          or ep == cfg.epochs - 1):
                 dz_e = predict(da_early)
                 e_e = da_early.z - da_early.z0
                 De = float((dz_e ** 2).mean())
@@ -282,6 +296,17 @@ def main() -> None:
                 a.ckpt.parent.mkdir(parents=True, exist_ok=True)
                 torch.save({"model": model.state_dict(), "fold": fi, "epoch": ep + 1},
                            Path(f"{a.ckpt}_fold{fi}.pt"))
+
+        if a.production:
+            Path(f"{a.ckpt}_prod.pt").parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"model": model.state_dict(), "fold": "prod",
+                        "epoch": cfg.epochs, "anchors": tr_anchors},
+                       Path(f"{a.ckpt}_prod.pt"))
+            print(f"  сохранено {a.ckpt}_prod.pt (эпоха {cfg.epochs})", flush=True)
+            results.append(dict(mode="production", epochs=cfg.epochs,
+                                anchors=tr_anchors, seed=cfg.seed))
+            del model; gc.collect()
+            continue
 
         # Берём эпоху с лучшим выигрышем на якоре подбора, а не последнюю:
         # кривая может пройти максимум и начать переобучаться.
@@ -328,7 +353,11 @@ def main() -> None:
     a.out.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
     print("\n=== итог ===")
     for r in results:
-        print(f"  фолд {r['fold']}: выигрыш {r['gain']:+.5f} (α={r['alpha']:+.4f})")
+        if "gain" in r:
+            print(f"  фолд {r['fold']}: выигрыш {r['gain']:+.5f} (α={r['alpha']:+.4f})")
+    if any("gain" not in r for r in results):
+        print("  боевой режим: оценки нет по построению")
+        print("ГОТОВО"); return
     ok = all(r["gain"] > 0.0002 for r in results)
     print(f"  критерий (плюс на ОБОИХ фолдах, > 0.0002): "
           f"{'ПРОЙДЕН' if ok else 'не пройден'}")
