@@ -72,3 +72,73 @@ $\mathbb{E}[z\mid x] = p(x)\,m(x)$ на вероятность покупки и
 
 Разрабатывалось на 18 GB RAM, 11 ядер, без GPU. Панель после даункаста занимает
 1.1 GB, пик при обучении 5–6 GB, полный цикл «валидация + сабмит» около 15 минут.
+
+---
+
+## Что лежит в `artifacts/` и зачем
+
+Репозиторий самодостаточен: чтобы повторить лучший сабмит, переобучать
+GBDT с нуля не нужно.
+
+### Веса моделей — `artifacts/neural/weights/`
+
+| Файл | Параметров | Что это |
+| :--- | ---: | :--- |
+| `gapgru_evt_ckpt_fold1.pt` | 229 557 | **из него сделан `v16`** — лучший результат |
+| `gapgru_evt_ckpt_fold0.pt` | 229 557 | тот же прогон, фолд 0 |
+| `pretrain_evt_fold0.pt`, `pretrain_evt_fold1.pt` | 229 557 | этап A, 6 эпох |
+| `gapgru_cyc_ckpt_fold*.pt`, `pretrain_cyc_fold*.pt` | 306 293 | прогон с покупочными циклами |
+
+### Базовые прогнозы — `artifacts/neural/oof_a*.npz`
+
+Честный $z_0$ на каждом якоре по схеме leave-one-anchor-out: прогноз на якорь
+делает пара LightGBM + CatBoost, **не видевшая этого якоря**. Шесть
+переобучений, около сорока минут — поэтому результат положен в репозиторий.
+
+Ключи: `user_id`, `y`, `z0`, `z0_lgb`, `z0_cb`. Последние два нужны не для
+отладки: их разность подаётся сети как признак-приор — расхождение семейств
+работает индикатором того, где базовый прогноз ненадёжен.
+
+### Поправки — `artifacts/neural/dz_a{378,408}.npz`
+
+$\Delta z$ обученной сети на валидационном и боевом якорях. Из `dz_a408.npz`
+собирается `v16`; `dz_a378.npz` позволяет перепроверить, что поправка
+не поглощается более сильным ансамблем.
+
+### Сабмиты — `artifacts/submission_*.csv`
+
+Оставлена ключевая линия, по которой восстанавливается вся цепочка приростов
+и обе параболы весов:
+
+| Файл | RMSLE (паблик) | Что добавлено |
+| :--- | ---: | :--- |
+| `submission_v10.csv` | 1.6508203 | ансамбль LightGBM, 19 моделей |
+| `submission_v15_cb.csv` | — | чистый ансамбль CatBoost |
+| `submission_v15_blend.csv` | 1.6502841 | $0.6\cdot$CatBoost $+\;0.4\cdot$v10 |
+| `submission_v16_gru.csv` | **1.6493404** | $+\;0.35\,\Delta z$ от Gap-GRU |
+
+Токены (12 ГБ) и логи TensorBoard в репозиторий не кладутся: токены
+собираются из `train.parquet` за четыре минуты, см. [CLUSTER.md](CLUSTER.md).
+
+### Как собрать `v16` из того, что в репозитории
+
+```python
+import numpy as np, polars as pl
+s   = pl.read_csv("data_start/sample_submit.csv")
+v15 = pl.read_csv("artifacts/submission_v15_blend.csv")
+d   = np.load("artifacts/neural/dz_a408.npz")
+
+j = (s.select("user_id")
+       .join(v15.rename({"predict": "p15"}), on="user_id", how="left")
+       .join(pl.DataFrame({"user_id": d["user_id"], "dz": d["dz"]}),
+             on="user_id", how="left"))
+z15, dz = np.log1p(j["p15"].to_numpy()), j["dz"].to_numpy()
+z = z15 + 0.35 * dz
+z = z - z.mean() + z15.mean()          # уровень берётся у v15, он проверен ЛБ
+pred = np.expm1(np.clip(z, 0.0, None))
+```
+
+Документы по темам: [SOLUTION.md](SOLUTION.md) — математика решения,
+[NEURAL.md](NEURAL.md) — нейросетевая ветка, [TRAINING.md](TRAINING.md) —
+инструменты и конфигурация, [EXPERIMENTS.md](EXPERIMENTS.md) — журнал гипотез,
+[CLUSTER.md](CLUSTER.md) — запуск на GPU.

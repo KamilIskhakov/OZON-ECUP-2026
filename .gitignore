@@ -7,6 +7,12 @@ data_work/
 # Сабмиты и результаты свипов
 artifacts/*.csv
 !artifacts/.gitkeep
+# Ключевая линия сабмитов остаётся в репозитории: по ней
+# восстанавливается вся цепочка приростов и параболы весов.
+!artifacts/submission_v10.csv
+!artifacts/submission_v15_blend.csv
+!artifacts/submission_v15_cb.csv
+!artifacts/submission_v16_gru.csv
 
 # Python
 __pycache__/
@@ -20,7 +26,8 @@ __pycache__/
 .vscode/
 .idea/
 artifacts/neural/tokens/
-artifacts/neural/*.npz
+# OOF-базы и поправки нужны, чтобы повторить обучение сети
+# без шести переобучений GBDT — оставляем.
 
 # секреты
 .env
