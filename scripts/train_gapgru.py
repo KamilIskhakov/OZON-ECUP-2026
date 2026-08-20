@@ -138,6 +138,10 @@ def main() -> None:
     ap.add_argument("--freeze-epochs", type=int, default=2,
                     help="эпох с замороженным энкодером после претрейна")
     ap.add_argument("--ckpt", type=Path, default=None)
+    ap.add_argument("--tb", type=Path, default=None,
+                    help="каталог логов TensorBoard")
+    ap.add_argument("--eval-every", type=int, default=2,
+                    help="каждые N эпох мерить выигрыш на якоре подбора α")
     ap.add_argument("--cycles", action="store_true",
                     help="включить вторую шкалу времени: токены покупочных циклов")
     ap.add_argument("--out", type=Path, default=Path("artifacts/neural/gapgru.json"))
@@ -154,6 +158,16 @@ def main() -> None:
     dev = pick_device()
     df = load_panel()
     print(f"устройство {dev} · длина {a.max_len}", flush=True)
+
+    def make_writer(tag):
+        if a.tb is None:
+            return None
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError:
+            print("  tensorboard не установлен, логи пропускаются", flush=True)
+            return None
+        return SummaryWriter(str(a.tb / tag))
 
     cache = {}
     def get(anchor):
@@ -193,6 +207,7 @@ def main() -> None:
                                                     total_steps=n_steps)
         bce, mse = nn.BCEWithLogitsLoss(), nn.MSELoss()
         rng = np.random.default_rng(cfg.seed)
+        tb = make_writer(f"stageB_fold{fi}")
 
         def predict(d):
             model.eval(); out = []
@@ -205,6 +220,14 @@ def main() -> None:
                                .float().cpu().numpy())
             model.train()
             return np.concatenate(out)
+
+        # Кривая сходимости по якорю подбора α. Он уже используется для
+        # подбора одного скаляра, поэтому выбор эпохи по нему согласован
+        # и не трогает тестовый якорь. Без этой кривой число эпох остаётся
+        # прикидкой — ровно той ошибкой, что была с числом деревьев.
+        da_early = get(alpha_anchor)
+        best = {"gain": -1.0, "epoch": 0, "state": None}
+        curve = []
 
         for ep in range(cfg.epochs):
             # Энкодер после претрейна сначала заморожен: остаток очень шумный,
@@ -228,13 +251,49 @@ def main() -> None:
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step(); sched.step()
                 tot += float(loss.item()); nb += 1
+            if tb is not None:
+                tb.add_scalar("loss/train", tot / max(nb, 1), ep + 1)
+                tb.add_scalar("lr", sched.get_last_lr()[0], ep + 1)
+                tb.add_scalar("frozen", int(frozen), ep + 1)
             print(f"  эпоха {ep+1}/{cfg.epochs}  loss {tot/max(nb,1):.5f}"
                   f"{'  [энкодер заморожен]' if frozen else ''}  "
                   f"{time.perf_counter()-t0:.0f}с", flush=True)
+            if (ep + 1) % a.eval_every == 0 or ep == cfg.epochs - 1:
+                dz_e = predict(da_early)
+                e_e = da_early.z - da_early.z0
+                De = float((dz_e ** 2).mean())
+                al = float((e_e * dz_e).mean()) / max(De, 1e-12)
+                g = float(e_e.std() - (e_e - al * dz_e).std())
+                curve.append((ep + 1, g, al, float(dz_e.std())))
+                if tb is not None:
+                    # главная кривая: не лосс, а переносимый выигрыш —
+                    # именно по ней принимается решение об эпохе
+                    tb.add_scalar("holdout/gain", g, ep + 1)
+                    tb.add_scalar("holdout/alpha", al, ep + 1)
+                    tb.add_scalar("holdout/std_dz", float(dz_e.std()), ep + 1)
+                    tb.add_histogram("holdout/dz", dz_e, ep + 1)
+                print(f"    якорь {alpha_anchor}: выигрыш {g:+.5f} · α {al:+.4f} · "
+                      f"std(Δz) {dz_e.std():.4f}", flush=True)
+                if g > best["gain"]:
+                    best = {"gain": g, "epoch": ep + 1,
+                            "state": {k: v.detach().cpu().clone()
+                                      for k, v in model.state_dict().items()}}
             if a.ckpt is not None:
                 a.ckpt.parent.mkdir(parents=True, exist_ok=True)
                 torch.save({"model": model.state_dict(), "fold": fi, "epoch": ep + 1},
                            Path(f"{a.ckpt}_fold{fi}.pt"))
+
+        # Берём эпоху с лучшим выигрышем на якоре подбора, а не последнюю:
+        # кривая может пройти максимум и начать переобучаться.
+        if best["state"] is not None and best["epoch"] != cfg.epochs:
+            model.load_state_dict(best["state"])
+            print(f"  восстановлена эпоха {best['epoch']} "
+                  f"(выигрыш {best['gain']:+.5f} против {curve[-1][1]:+.5f} на последней)",
+                  flush=True)
+        if a.ckpt is not None:
+            torch.save({"model": model.state_dict(), "fold": fi,
+                        "epoch": best["epoch"], "curve": curve},
+                       Path(f"{a.ckpt}_fold{fi}.pt"))
 
         # α на отдельном якоре: парабола MSE(α) = MSE(0) - 2αC + α²D
         da = get(alpha_anchor); dz_a = predict(da)
@@ -245,6 +304,7 @@ def main() -> None:
         base = float((dt.z - dt.z0).std())
         got = float((dt.z - dt.z0 - alpha * dz_t).std())
         row = dict(fold=fi, alpha=alpha, D=D, C=C, shape_base=base,
+                   best_epoch=best["epoch"], curve=curve,
                    shape_corrected=got, gain=base - got,
                    alpha_anchor_gain=float((e).std() - (e - alpha * dz_a).std()),
                    std_dz=float(dz_t.std()))
@@ -257,6 +317,10 @@ def main() -> None:
               f"выигрыш {row['gain']:+.5f}\n"
               f"  перенос: {100 * row['gain'] / max(row['alpha_anchor_gain'], 1e-9):.0f}% "
               f"выигрыша якоря подбора", flush=True)
+        if tb is not None:
+            tb.add_scalar("final/gain_test", row["gain"], 0)
+            tb.add_scalar("final/alpha", alpha, 0)
+            tb.close()
         results.append(row)
         del model; gc.collect()
 

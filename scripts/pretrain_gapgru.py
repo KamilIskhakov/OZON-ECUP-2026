@@ -66,6 +66,7 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--tb", type=Path, default=None, help="каталог логов TensorBoard")
     ap.add_argument("--cycles", action="store_true",
                     help="вторая шкала времени: токены покупочных циклов")
     ap.add_argument("--out", type=Path, required=True)
@@ -125,6 +126,14 @@ def main() -> None:
         opt, max_lr=cfg.lr, total_steps=a.epochs * (n_per // a.batch_size + len(store)))
     print(f"примеров {n_per:,} · параметров "
           f"{sum(p.numel() for p in model.parameters()):,}", flush=True)
+
+    tb = None
+    if a.tb is not None:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb = SummaryWriter(str(a.tb / f"stageA_{a.out.stem}"))
+        except ImportError:
+            print("  tensorboard не установлен, логи пропускаются", flush=True)
 
     for ep in range(a.epochs):
         t0, tot, nb = time.perf_counter(), 0.0, 0

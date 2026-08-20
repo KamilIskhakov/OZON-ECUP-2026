@@ -10,15 +10,17 @@
 set -euo pipefail
 MAXLEN=${MAXLEN:-192}
 USERS=${USERS:-0}
-EPOCHS_A=${EPOCHS_A:-6}
-EPOCHS_B=${EPOCHS_B:-12}
+EPOCHS_A=${EPOCHS_A:-15}
+EPOCHS_B=${EPOCHS_B:-40}
+EVAL_EVERY=${EVAL_EVERY:-2}
 BS=${BS:-2048}
 # ARCH=evt — Gap-GRU + многозапросная голова (контроль)
 # ARCH=cyc — то же плюс вторая шкала времени: покупочные циклы
 ARCH=${ARCH:-evt}
 CYC=$([ "$ARCH" = cyc ] && echo "--cycles" || echo "")
 OUT=artifacts/neural
-mkdir -p "$OUT/logs"
+TB=${TB:-$OUT/tb}
+mkdir -p "$OUT/logs" "$TB"
 
 echo "### архитектура: $ARCH"
 echo "### 1/3 токены (max_len=$MAXLEN)"
@@ -33,14 +35,14 @@ for FOLD in 0 1; do
     echo "### 2/3 этап A, фолд $FOLD (срезы до $((LIMIT-30)))"
     python scripts/pretrain_gapgru.py --limit-anchor "$LIMIT" \
         --max-len "$MAXLEN" --epochs "$EPOCHS_A" --batch-size "$BS" \
-        $CYC --out "$OUT/pretrain_${ARCH}_fold${FOLD}.pt" \
+        --tb "$TB" $CYC --out "$OUT/pretrain_${ARCH}_fold${FOLD}.pt" \
         2>&1 | tee "$OUT/logs/pretrain_${ARCH}_f${FOLD}.log"
 done
 
 echo "### 3/3 этап B: остаток к ансамблю, два фолда"
 python scripts/train_gapgru.py --max-len "$MAXLEN" --epochs "$EPOCHS_B" \
     --batch-size "$BS" --init-from "$OUT/pretrain_${ARCH}" --freeze-epochs 2 \
-    $CYC --ckpt "$OUT/gapgru_${ARCH}_ckpt" --out "$OUT/gapgru_${ARCH}.json" \
+    --eval-every "$EVAL_EVERY" --tb "$TB" $CYC --ckpt "$OUT/gapgru_${ARCH}_ckpt" --out "$OUT/gapgru_${ARCH}.json" \
     2>&1 | tee "$OUT/logs/train_${ARCH}.log"
 
 echo "### результат"

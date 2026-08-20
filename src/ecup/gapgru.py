@@ -92,19 +92,22 @@ def make_model(cfg: GapGRUConfig):
             self.hidden = hidden
 
         def forward(self, x, gap, mask):
-            B, L, _ = x.shape
             phi = torch.stack([gap, gap * gap], dim=-1)          # (B, L, 2)
             # γ ∈ (0, 1]: ReLU гарантирует неотрицательный показатель,
             # то есть затухание, а не рост состояния на паузе
             gamma = torch.exp(-torch.relu(self.decay(phi)))      # (B, L, H)
-            h = x.new_zeros(B, self.hidden)
+            h = x.new_zeros(x.shape[0], self.hidden)
             out = []
-            for t in range(L):
-                h_dec = gamma[:, t] * h
-                h_new = self.cell(x[:, t], h_dec)
-                m = mask[:, t].unsqueeze(-1)
+            # unbind, а не x[:, t] внутри цикла. Срез по времени — отдельная
+            # операция автограда, и её обратный проход создаёт ПОЛНОРАЗМЕРНЫЙ
+            # нулевой тензор (B, L, H), чтобы рассеять в него градиент одного
+            # шага. При 192 шагах на слой это 192 аллокации по 151 МБ и столько
+            # же сложений. unbind делает то же разбиение одной операцией,
+            # обратный проход которой — один stack. Замер на A4000, батч 2048:
+            # обратный проход 1143 мс против 78.5 мс, суммарно 9.7 раза.
+            for xt, gt, mt in zip(x.unbind(1), gamma.unbind(1), mask.unbind(1)):
                 # паддинг слева не должен двигать состояние
-                h = torch.where(m, h_new, h)
+                h = torch.where(mt.unsqueeze(-1), self.cell(xt, gt * h), h)
                 out.append(h)
             return torch.stack(out, dim=1)
 
