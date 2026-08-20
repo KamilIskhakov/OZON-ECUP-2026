@@ -26,3 +26,6 @@ artifacts/neural/*.npz
 .env
 .env.*
 !.env.example
+
+artifacts/neural/tb/
+artifacts/neural/pretrain/
