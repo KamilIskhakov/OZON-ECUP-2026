@@ -24,6 +24,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+HORIZON = 30
 TRAIN_ANCHORS = [198, 228, 258, 288, 318, 348]
 VAL_ANCHOR = 378
 FOLDS = [(TRAIN_ANCHORS[:4], 318, 348), (TRAIN_ANCHORS[:5], 348, VAL_ANCHOR)]
@@ -205,6 +206,10 @@ def main() -> None:
                     help="однородных батчей на один шаг оптимизатора")
     ap.add_argument("--lambda-mse", type=float, default=0.1,
                     help="вес слабого residual-MSE при --loss dir")
+    ap.add_argument("--dense-dir", type=Path, default=None,
+                    help="каталог плотных срезов; добавляются к обучающим якорям")
+    ap.add_argument("--dense-frac", type=float, default=0.5,
+                    help="доля срезов, берущаяся в каждую эпоху")
     ap.add_argument("--production", action="store_true",
                     help="обучать на ВСЕХ якорях включая 348 и 378, без оценки; "
                          "число эпох и alpha берутся из проверенного фолдового прогона")
@@ -263,6 +268,20 @@ def main() -> None:
             print(f"\n=== фолд {fi}: обучение {tr_anchors} · α на {alpha_anchor} · "
                   f"оценка на {test_anchor} ===", flush=True)
         tr = [get(x) for x in tr_anchors]
+        # Плотные срезы: целевые окна соседних пересекаются, поэтому примеры
+        # зависимы, и трактовать их как втрое больший независимый набор нельзя.
+        # В каждую эпоху берётся случайное подмножество срезов — это ограничивает
+        # долю зависимых пар в одном проходе, оставляя разнообразие между
+        # эпохами. Пуржинг тот же: T + 30 <= якорь подбора α.
+        dense = []
+        if a.dense_dir is not None:
+            lim = (max(tr_anchors) if a.production else alpha_anchor) - HORIZON
+            for f in sorted(a.dense_dir.glob("oof_a*.npz")):
+                T = int(f.stem.split("_a")[1])
+                if T <= lim and T not in tr_anchors:
+                    dense.append(AnchorData(T, a.dense_dir, a.dense_dir, df))
+            print(f"  плотных срезов: {len(dense)} (до {lim} включительно), "
+                  f"в эпоху берётся {a.dense_frac:.0%}", flush=True)
         cfg = GapGRUConfig(n_features=len(TOKEN_FEATURES) - 2, max_len=a.max_len,
                            lambda_delta=a.lambda_delta, lr=a.lr,
                            batch_size=a.batch_size, epochs=a.epochs, seed=a.seed,
@@ -282,7 +301,11 @@ def main() -> None:
         enc = [p_ for n_, p_ in model.named_parameters() if not n_.startswith(("trunk", "head_dz"))]
         opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                 weight_decay=cfg.weight_decay)
-        n_steps = cfg.epochs * (sum(len(d) for d in tr) // cfg.batch_size + 1)
+        # Плотные срезы увеличивают число батчей в эпохе, и планировщик,
+        # рассчитанный только по основным якорям, упирается в лимит шагов.
+        # Берём верхнюю оценку со всеми срезами плюс запас.
+        n_rows = sum(len(d) for d in tr) + sum(len(d) for d in dense)
+        n_steps = int(cfg.epochs * (n_rows // cfg.batch_size + len(tr) + len(dense) + 2))
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=cfg.lr,
                                                     total_steps=n_steps)
         bce, mse = nn.BCEWithLogitsLoss(), nn.MSELoss()
@@ -328,7 +351,11 @@ def main() -> None:
                 p_.requires_grad_(not frozen)
             t0, tot, nb = time.perf_counter(), 0.0, 0
             step = 0
-            for parts, fx in batches(tr, cfg.batch_size, rng, (gi, ai),
+            pool = tr
+            if dense and not frozen:
+                k = max(1, int(round(len(dense) * a.dense_frac)))
+                pool = tr + [dense[i] for i in rng.choice(len(dense), k, replace=False)]
+            for parts, fx in batches(pool, cfg.batch_size, rng, (gi, ai),
                                      max_len=a.max_len,
                                      homogeneous=(a.loss == "dir")):
                 X, g, ag, m, pr, z, z0, c, nbuy, nord, cy, grp, ngrp = to_torch(
@@ -354,7 +381,9 @@ def main() -> None:
                 step += 1
                 if step % acc == 0:
                     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    opt.step(); sched.step()
+                    opt.step()
+                    if sched.last_epoch + 1 < n_steps:
+                        sched.step()
                     opt.zero_grad(set_to_none=True)
                 tot += float(loss.item()); nb += 1
             if tb is not None:
