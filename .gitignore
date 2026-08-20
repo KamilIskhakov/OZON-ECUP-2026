@@ -13,6 +13,10 @@ artifacts/*.csv
 !artifacts/submission_v15_blend.csv
 !artifacts/submission_v15_cb.csv
 !artifacts/submission_v16_gru.csv
+!artifacts/submission_v17_seeds.csv
+!artifacts/submission_v18_2dir.csv
+!artifacts/submission_v19_yoy.csv
+!artifacts/submission_v20_yoy_scaled.csv
 
 # Python
 __pycache__/
