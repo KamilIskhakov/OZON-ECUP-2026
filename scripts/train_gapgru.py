@@ -29,6 +29,41 @@ VAL_ANCHOR = 378
 FOLDS = [(TRAIN_ANCHORS[:4], 318, 348), (TRAIN_ANCHORS[:5], 348, VAL_ANCHOR)]
 
 
+def directional_loss(e, d, grp, n_grp, eps: float = 1e-4):
+    """Лосс, оптимизирующий то, что реально используется на лидерборде.
+
+    Downstream мы берём ẑ = z₀ + α·d, где α находится аналитически как
+    вершина параболы. Значит МАСШТАБ d выбрасывается по построению, и
+    остаточная дисперсия равна
+
+        Var(e − α*d) = Var(e) − Cov(e,d)² / Var(d)
+
+    То есть максимизировать надо J(d) = Cov(e,d)²/Var(d), а не минимизировать
+    MSE(e, d). Обычный residual-MSE тратит ёмкость на подгонку масштаба
+    реализации остатка на обучающих якорях — ровно то, что видно в замере:
+    при долгом обучении std(Δz) вырос 0.037 → 0.773, а оптимальный α упал
+    1.158 → 0.012, при монотонно падающем лоссе и умирающем переносе.
+
+    Берём знаковую версию −Cov/√Var, а не −Cov²/Var: у неё нормальный
+    градиент вблизи нулевой головы, и направление сразу ориентируется
+    в правильную сторону, а не в любую из двух.
+
+    Центрирование РАЗДЕЛЬНОЕ ПО ЯКОРЯМ: остаток имеет собственное смещение
+    на каждом якоре (замерено +0.033 и −0.038 на 318 и 348), и общее
+    центрирование занесло бы межъякорную разницу уровней в ковариацию
+    как ложный сигнал.
+    """
+    import torch
+    cnt = torch.zeros(n_grp, device=e.device, dtype=e.dtype).index_add_(
+        0, grp, torch.ones_like(e)).clamp(min=1.0)
+    me = torch.zeros(n_grp, device=e.device, dtype=e.dtype).index_add_(0, grp, e) / cnt
+    md = torch.zeros(n_grp, device=e.device, dtype=e.dtype).index_add_(0, grp, d) / cnt
+    ec, dc = e - me[grp], d - md[grp]
+    cov = (ec * dc).mean()
+    var = (dc * dc).mean()
+    return -cov / torch.sqrt(var + eps)
+
+
 def aux_targets(df, anchor, users, horizon=30):
     """Вспомогательные цели: покупал ли, сколько дней с покупкой, сколько заказов.
 
@@ -104,8 +139,10 @@ def batches(datasets, bs, rng, feat_idx, shuffle=True, max_len=None):
 def to_torch(parts, feat_idx, dev, max_len):
     import torch
     Xs, gaps, ages, masks, priors, zs, z0s, cs, nbs, nos, cyc = ([] for _ in range(11))
+    grp = []
     gi, ai = feat_idx
-    for d, loc, X, C in parts:
+    for gidx, (d, loc, X, C) in enumerate(parts):
+        grp.append(np.full(len(loc), gidx, dtype="int64"))
         if C is not None:
             cyc.append(C)
         L = d.lengths[loc]
@@ -119,7 +156,7 @@ def to_torch(parts, feat_idx, dev, max_len):
     T = lambda a, t=torch.float32: torch.as_tensor(np.concatenate(a), dtype=t, device=dev)
     return (T(Xs), T(gaps), T(ages), T(masks, torch.bool), T(priors),
             T(zs), T(z0s), T(cs), T(nbs), T(nos),
-            T(cyc) if cyc else None)
+            T(cyc) if cyc else None, T(grp, torch.int64), len(parts))
 
 
 def main() -> None:
@@ -138,6 +175,10 @@ def main() -> None:
     ap.add_argument("--freeze-epochs", type=int, default=2,
                     help="эпох с замороженным энкодером после претрейна")
     ap.add_argument("--ckpt", type=Path, default=None)
+    ap.add_argument("--loss", choices=("mse", "dir"), default="mse",
+                    help="mse — residual-MSE; dir — направленный Cov/sqrt(Var)")
+    ap.add_argument("--lambda-mse", type=float, default=0.1,
+                    help="вес слабого residual-MSE при --loss dir")
     ap.add_argument("--production", action="store_true",
                     help="обучать на ВСЕХ якорях включая 348 и 378, без оценки; "
                          "число эпох и alpha берутся из проверенного фолдового прогона")
@@ -227,7 +268,8 @@ def main() -> None:
             with torch.no_grad():
                 for parts, fx in batches([d], 4096, rng, (gi, ai), shuffle=False,
                                          max_len=a.max_len):
-                    X, g, ag, m, pr, *_, cy = to_torch(parts, fx, dev, a.max_len)
+                    X, g, ag, m, pr, _z, _z0, _c, _nb, _no, cy, _gr, _ng = to_torch(
+                        parts, fx, dev, a.max_len)
                     out.append(model(X, g, ag, m, pr,
                                      cycles=cy if a.cycles else None)[0]
                                .float().cpu().numpy())
@@ -252,11 +294,17 @@ def main() -> None:
             t0, tot, nb = time.perf_counter(), 0.0, 0
             for parts, fx in batches(tr, cfg.batch_size, rng, (gi, ai),
                                      max_len=a.max_len):
-                X, g, ag, m, pr, z, z0, c, nbuy, nord, cy = to_torch(
+                X, g, ag, m, pr, z, z0, c, nbuy, nord, cy, grp, ngrp = to_torch(
                     parts, fx, dev, a.max_len)
                 opt.zero_grad(set_to_none=True)
                 dz, aux = model(X, g, ag, m, pr, cycles=cy if a.cycles else None)
-                loss = mse(z0 + dz, z) + cfg.lambda_delta * (dz ** 2).mean()
+                if a.loss == "dir":
+                    # штраф на масштаб здесь не нужен и вреден: целевая
+                    # функция инвариантна к масштабу по построению
+                    loss = (directional_loss(z - z0, dz, grp, ngrp)
+                            + a.lambda_mse * mse(z0 + dz, z))
+                else:
+                    loss = mse(z0 + dz, z) + cfg.lambda_delta * (dz ** 2).mean()
                 loss = loss + cfg.aux_weights["p"] * bce(aux["p"], c)
                 loss = loss + cfg.aux_weights["n_buy"] * mse(aux["n_buy"], nbuy)
                 loss = loss + cfg.aux_weights["n_ord"] * mse(aux["n_ord"], nord)
