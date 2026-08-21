@@ -42,3 +42,5 @@ artifacts/neural/tb/
 artifacts/neural/pretrain/
 
 !artifacts/submission_v21_scale.csv
+
+!artifacts/submission_v22_annual.csv
