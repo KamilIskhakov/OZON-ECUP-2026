@@ -157,7 +157,8 @@ def make_model(cfg: GapGRUConfig):
             nn.init.zeros_(self.head_dz.weight); nn.init.zeros_(self.head_dz.bias)
             self.aux = nn.ModuleDict({k: nn.Linear(d, 1) for k in cfg.aux_weights})
 
-        def forward(self, x, gap, age, mask, prior, cycles=None):
+        def forward(self, x, gap, age, mask, prior, cycles=None,
+                    return_features=False):
             """prior — (z0, расхождение семейств, длина), нормированные снаружи."""
             h = self.inp(x)
             for layer in self.layers:
@@ -181,9 +182,16 @@ def make_model(cfg: GapGRUConfig):
                     raise ValueError("модель собрана с use_cycles, но циклы не поданы")
                 hc = self.cyc(self.cyc_in(cycles) + self.cyc_pos.unsqueeze(0))
                 feats.insert(2, hc[:, -1])                      # последний цикл = ближайший
-            z = self.trunk(torch.cat(feats, -1))
+            joined = torch.cat(feats, -1)
+            z = self.trunk(joined)
             dz = self.head_dz(z).squeeze(-1)
-            return dz, {k: head(z).squeeze(-1) for k, head in self.aux.items()}
+            aux = {k: head(z).squeeze(-1) for k, head in self.aux.items()}
+            if return_features:
+                # Представление состояния пользователя для retrieval: вход
+                # ствола (сырые факторы) и его выход (сжатое представление).
+                # Первый несёт больше, второй компактнее и уже отобран задачей.
+                return dz, aux, joined, z
+            return dz, aux
 
     torch.manual_seed(cfg.seed)
     return GapGRUNet()
