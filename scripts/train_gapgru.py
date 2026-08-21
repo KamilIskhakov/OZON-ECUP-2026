@@ -209,6 +209,12 @@ def main() -> None:
     ap.add_argument("--freeze-epochs", type=int, default=2,
                     help="эпох с замороженным энкодером после претрейна")
     ap.add_argument("--ckpt", type=Path, default=None)
+    ap.add_argument("--distill", type=Path, default=None,
+                    help="замороженный учитель этапа A; дистиллируется ТОЛЬКО "
+                         "просевшая функция (каталожная голова)")
+    ap.add_argument("--distill-head", default="catalog")
+    ap.add_argument("--distill-ratio", type=float, default=0.15,
+                    help="целевое отношение норм градиентов дистилляции к остатку")
     ap.add_argument("--residual", choices=("z", "p", "m", "pm"), default="z",
                     help="что исправляет сеть: z напрямую, вероятность покупки, "
                          "условную сумму или обе части hurdle")
@@ -330,6 +336,36 @@ def main() -> None:
         # иначе первый же шаг сдвинет прогноз, не объяснив ошибку.
         nn.init.zeros_(model.head_dz.weight); nn.init.zeros_(model.head_dz.bias)
         enc = [p_ for n_, p_ in model.named_parameters() if not n_.startswith(("trunk", "head_dz"))]
+        # Учитель заморожен: дистиллируется ФУНКЦИЯ, а не координаты.
+        # Прямая привязка ||h_B - h_A||^2 запрещала бы полезный поворот
+        # базиса, а CKA(A,B) = 0.7376 показывает, что поворот как раз
+        # безвреден — геометрия сохраняется. Просела только каталожная
+        # голова (-0.0801 по линейной пробе), её и удерживаем.
+        teacher = None
+        if a.distill is not None:
+            tsrc = Path(f"{a.distill}_fold{fi}.pt")
+            tck = torch.load(tsrc, map_location=dev, weights_only=False)
+            tcfg = GapGRUConfig(n_features=len(TOKEN_FEATURES) - 2,
+                                max_len=a.max_len, queries=tuple(tck["queries"]))
+            teacher = make_model(tcfg).to(dev)
+            tmiss, _ = teacher.load_state_dict(tck["model"], strict=False)
+            # strict=False уже несколько раз маскировал несовпадение
+            # архитектур. Вся гипотеза опирается ровно на одну голову,
+            # поэтому её присутствие проверяется явно: иначе можно
+            # удерживать случайно инициализированную функцию.
+            bad = [k for k in tmiss if a.distill_head in k]
+            if bad:
+                raise RuntimeError(
+                    f"голова '{a.distill_head}' не загрузилась из учителя: {bad}")
+            n_head = sum(1 for k in tck["model"] if a.distill_head in k)
+            if n_head == 0:
+                raise RuntimeError(
+                    f"в чекпоинте учителя нет весов головы '{a.distill_head}'")
+            teacher.eval()
+            for p_ in teacher.parameters():
+                p_.requires_grad_(False)
+            print(f"  учитель {tsrc.name}, дистиллируется голова "
+                  f"'{a.distill_head}'", flush=True)
         opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                 weight_decay=cfg.weight_decay)
         # Плотные срезы увеличивают число батчей в эпохе, и планировщик,
@@ -376,6 +412,7 @@ def main() -> None:
         # его всё равно поглотит α. Один подобранный скаляр на всё,
         # в отличие от стекинга с весом на каждого участника.
         acc_a, acc_t, n_acc = None, None, 0
+        lam_dist, lam_samples = None, []
         # В боевом режиме тестового якоря нет по построению — там нечего
         # оценивать, и попытка загрузить его токены даёт meta_aNone.npz.
         dt_test = None if a.production else get(test_anchor)
@@ -400,7 +437,20 @@ def main() -> None:
                     parts, fx, dev, a.max_len)
                 if a.loss != "dir":
                     opt.zero_grad(set_to_none=True)
-                dz, aux = model(X, g, ag, m, pr, cycles=cy if a.cycles else None)
+                # Один прямой проход ученика на батч: раньше их было два —
+                # отдельно для лосса и отдельно ради выходов факторов,
+                # оба с графом на 192 шага, что давало OOM.
+                want_f = teacher is not None and not frozen
+                l_dist = None
+                if want_f:
+                    dz, aux, sf = model(X, g, ag, m, pr,
+                                        cycles=cy if a.cycles else None,
+                                        factor_out=True)
+                    with torch.no_grad():
+                        _, _, tf = teacher(X, g, ag, m, pr, factor_out=True)
+                    l_dist = ((sf[a.distill_head] - tf[a.distill_head]) ** 2).mean()
+                else:
+                    dz, aux = model(X, g, ag, m, pr, cycles=cy if a.cycles else None)
                 if a.residual != "z":
                     p0 = pm0[:, 0].clamp(1e-6, 1 - 1e-6); m0 = pm0[:, 1]
                     lp = torch.log(p0 / (1 - p0))
@@ -428,6 +478,36 @@ def main() -> None:
                 # Однородные батчи делают каждый шаг видящим один якорь.
                 # Чтобы градиент не гулял вслед за идиосинкразией окна,
                 # накапливаем несколько якорей на один шаг оптимизатора.
+                if l_dist is not None:
+                    # lambda калибруется отношением норм градиентов на первом
+                    # разморозенном шаге, а не подбором по метрике: иначе
+                    # появилась бы ещё одна ось подгонки на двух фолдах.
+                    if lam_dist is None:
+                        gr = torch.autograd.grad(loss, enc, retain_graph=True,
+                                                 allow_unused=True)
+                        gd = torch.autograd.grad(l_dist, enc, retain_graph=True,
+                                                 allow_unused=True)
+                        nr = sum(float(x.norm()) for x in gr if x is not None)
+                        nd = sum(float(x.norm()) for x in gd if x is not None)
+                        # На первом разморозенном шаге ученик ТОЖДЕСТВЕН
+                        # учителю: энкодер не менялся, головы из того же
+                        # чекпоинта. Тогда l_dist = 0 и отношение взрывается.
+                        # Ждём, пока расхождение станет измеримым.
+                        if nd > 1e-4 * max(nr, 1e-9):
+                            # Медиана по нескольким невырожденным батчам:
+                            # первая точка сразу после расхождения учителя
+                            # и ученика очень шумная.
+                            lam_samples.append(nr / nd)
+                            if len(lam_samples) >= 12:
+                                lam_dist = min(a.distill_ratio
+                                               * float(np.median(lam_samples)), 1e3)
+                                print(f"    lambda дистилляции {lam_dist:.4f} "
+                                      f"(медиана {len(lam_samples)} батчей, "
+                                      f"разброс {np.percentile(lam_samples,10):.1f}"
+                                      f"…{np.percentile(lam_samples,90):.1f})",
+                                      flush=True)
+                    if lam_dist is not None:
+                        loss = loss + lam_dist * l_dist
                 acc = a.accum if a.loss == "dir" else 1
                 (loss / acc).backward()
                 step += 1
