@@ -52,6 +52,20 @@ class GapGRUConfig:
     # Один запрос вынужден одним вектором обслуживать все головы сразу;
     # четыре специализируются.
     queries: tuple[str, ...] = ("freq", "amount", "intent", "activity")
+    # Раздельный supervision: каждая голова читает ТОЛЬКО свой запрос.
+    # Без этого специализация остаётся номинальной — четыре разных вектора
+    # параметров без разных обязанностей.
+    factor_heads: dict = field(default_factory=lambda: {
+        "freq":     ("n_ord7", "n_ord30", "n_buyday30"),
+        "amount":   ("z_pos30", "aov30"),
+        "intent":   ("c3", "c7", "c14", "c30"),
+        "activity": ("n_act7", "n_act30"),
+        "search":   ("z_s7", "z_s30", "c_s30"),
+        "catalog":  ("z_c7", "z_c30", "c_c30"),
+        # Уровень пользователя деревья знают хорошо; полезнее учить динамику:
+        # ускоряется он или затухает.
+        "transition": ("dz30", "dn30", "tau3", "tau7", "tau14", "tau30"),
+    })
     # Ветка покупочных циклов: маленький трансформер по 16 токенам.
     use_cycles: bool = False
     n_cycle_features: int = 8
@@ -125,6 +139,7 @@ def make_model(cfg: GapGRUConfig):
             # состояния и прогноза ансамбля: «что в прошлом релевантно этому
             # фактору при том, что модель предсказывает сейчас».
             self.q_emb = nn.Parameter(torch.zeros(self.nq, cfg.hidden + 3))
+            self.qname = list(cfg.queries)
             nn.init.normal_(self.q_emb, std=0.02)
             self.q = nn.Linear(cfg.hidden + 3, dh)
             self.k = nn.Linear(cfg.hidden, dh)
@@ -156,9 +171,14 @@ def make_model(cfg: GapGRUConfig):
             self.head_dz = nn.Linear(d, 1)
             nn.init.zeros_(self.head_dz.weight); nn.init.zeros_(self.head_dz.bias)
             self.aux = nn.ModuleDict({k: nn.Linear(d, 1) for k in cfg.aux_weights})
+            # Голова фактора видит только свой контекст размерности dh.
+            self.factor = nn.ModuleDict({
+                q: nn.Sequential(nn.Linear(cfg.d_head * cfg.n_heads, 64), nn.GELU(),
+                                 nn.Linear(64, len(tg)))
+                for q, tg in cfg.factor_heads.items() if q in cfg.queries})
 
         def forward(self, x, gap, age, mask, prior, cycles=None,
-                    return_features=False):
+                    return_features=False, factor_out=False):
             """prior — (z0, расхождение семейств, длина), нормированные снаружи."""
             h = self.inp(x)
             for layer in self.layers:
@@ -186,6 +206,12 @@ def make_model(cfg: GapGRUConfig):
             z = self.trunk(joined)
             dz = self.head_dz(z).squeeze(-1)
             aux = {k: head(z).squeeze(-1) for k, head in self.aux.items()}
+            if factor_out:
+                # (B, nq, dh) — контекст каждого запроса по отдельности
+                ctx = c.view(B, self.nq, -1)
+                fo = {q: self.factor[q](ctx[:, i])
+                      for i, q in enumerate(self.qname) if q in self.factor}
+                return dz, aux, fo
             if return_features:
                 # Представление состояния пользователя для retrieval: вход
                 # ствола (сырые факторы) и его выход (сжатое представление).
