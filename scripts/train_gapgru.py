@@ -282,10 +282,18 @@ def main() -> None:
                     dense.append(AnchorData(T, a.dense_dir, a.dense_dir, df))
             print(f"  плотных срезов: {len(dense)} (до {lim} включительно), "
                   f"в эпоху берётся {a.dense_frac:.0%}", flush=True)
+        # Набор запросов берётся ИЗ ЧЕКПОИНТА: претрейн-2 обучает семь
+        # запросов, и модель с четырьмя по умолчанию молча отбросила бы
+        # три из них вместе с их головами при strict=False.
+        qs = GapGRUConfig().queries
+        if a.init_from is not None:
+            src = Path(f"{a.init_from}_fold{fi}.pt")
+            if src.exists():
+                qs = tuple(torch.load(src, map_location="cpu").get("queries", qs))
         cfg = GapGRUConfig(n_features=len(TOKEN_FEATURES) - 2, max_len=a.max_len,
                            lambda_delta=a.lambda_delta, lr=a.lr,
                            batch_size=a.batch_size, epochs=a.epochs, seed=a.seed,
-                           use_cycles=a.cycles)
+                           use_cycles=a.cycles, queries=qs)
         model = make_model(cfg).to(dev)
         if a.init_from is not None:
             src = Path(f"{a.init_from}_fold{fi}.pt")
@@ -293,8 +301,14 @@ def main() -> None:
                 raise FileNotFoundError(f"нет чекпоинта этапа A: {src}")
             sd = torch.load(src, map_location=dev)["model"]
             missing, unexpected = model.load_state_dict(sd, strict=False)
-            print(f"  претрейн загружен из {src.name}"
-                  + (f" (не найдено: {len(missing)})" if missing else ""), flush=True)
+            enc_missing = [k for k in missing if not k.startswith(("trunk", "head_dz"))]
+            if enc_missing:
+                raise RuntimeError(
+                    f"в чекпоинте нет весов энкодера: {enc_missing[:5]} "
+                    f"(всего {len(enc_missing)}) — архитектуры не совпадают")
+            print(f"  претрейн загружен из {src.name} · запросов {len(qs)} · "
+                  f"не найдено в чекпоинте {len(missing)}, лишних {len(unexpected)}",
+                  flush=True)
         # Голова поправки должна стартовать с нуля даже после претрейна:
         # иначе первый же шаг сдвинет прогноз, не объяснив ошибку.
         nn.init.zeros_(model.head_dz.weight); nn.init.zeros_(model.head_dz.bias)

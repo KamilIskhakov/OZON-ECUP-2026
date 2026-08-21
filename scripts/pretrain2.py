@@ -118,6 +118,10 @@ def main() -> None:
 
     files = []
     for c in cuts:
+        # Кэш ключуется СРЕЗОМ, а не предельным якорем: содержимое среза
+        # зависит только от c и набора пользователей, а предел лишь
+        # определяет, какие срезы берутся. Общий кэш экономит и диск,
+        # и время пересборки для второго фолда.
         f = a.cache / f"c{c}_{a.max_len}_{a.users}.npz"
         if not f.exists():
             t0 = time.perf_counter()
@@ -157,23 +161,57 @@ def main() -> None:
         except ImportError:
             pass
 
+    # Соответствие пользователь -> (срез, строка). Наборы пользователей
+    # у срезов РАЗНЫЕ (180796 против 197379 при пересечении 166768), и
+    # сортировка сдвигает индексы: совпадение по номеру строки нулевое.
+    # Поэтому выбор случайного среза делается по user_id, иначе получается
+    # не «одно состояние на пользователя», а случайный индекс строки.
+    data = [np.load(f) for f in files]
+    uni = np.unique(np.concatenate([d_["uid"] for d_ in data]))
+    pos = np.full((len(uni), len(files)), -1, dtype=np.int32)
+    for fi, d_ in enumerate(data):
+        pos[np.searchsorted(uni, d_["uid"]), fi] = np.arange(len(d_["uid"]))
+    n_ok = (pos >= 0).sum(1)
+    print(f"пользователей {len(uni):,} · срезов на пользователя в среднем "
+          f"{n_ok.mean():.1f}", flush=True)
+
     for ep in range(a.epochs):
         t0, tot, nb = time.perf_counter(), 0.0, 0
-        # Каждую эпоху пользователь берётся на СВОЁМ случайном срезе.
-        data = [np.load(f) for f in files]
-        pick = rng.integers(0, len(files), size=max(len(d["L"]) for d in data))
-        order = []
-        for fi, d_ in enumerate(data):
-            n = len(d_["L"])
-            order += [(fi, i) for i in np.where(pick[:n] == fi)[0]]
-        rng.shuffle(order)
-        order = np.array(order, dtype=np.int64)
-        for s in range(0, len(order), a.batch_size):
-            ch = order[s:s + a.batch_size]
+        # Один пользователь — один случайный срез из доступных ему.
+        choice = np.floor(rng.random(len(uni)) * n_ok).astype(np.int64)
+        valid = pos >= 0
+        cum = np.cumsum(valid, axis=1)
+        sel = (cum == (choice[:, None] + 1)) & valid
+        fidx = sel.argmax(1)
+        rows = pos[np.arange(len(uni)), fidx]
+        keep = n_ok > 0
+        # Батчи ОДНОРОДНЫ по срезу: стоимость рекуррентного прохода
+        # определяется 192 последовательными запусками ядер и от размера
+        # батча почти не зависит, поэтому дробление батча на десять
+        # подбатчей по сотне стоило бы вдесятеро дороже.
+        order = np.stack([fidx[keep], rows[keep]], 1)
+        order = order[np.lexsort((order[:, 1], order[:, 0]))]
+        # Файлы кэша — .npz, и обращение d["X"][idx] читает МАССИВ ЦЕЛИКОМ
+        # при каждом доступе. Поэтому массив загружается один раз на файл,
+        # а не на батч: иначе каждый шаг стоил бы чтения 1.4 ГБ.
+        # Порядок файлов перемешивается каждую эпоху, и назначение
+        # пользователь->срез тоже, так что систематического сдвига нет.
+        per_file = {fi: order[order[:, 0] == fi, 1] for fi in range(len(files))}
+        blocks = []
+        for fi in rng.permutation(len(files)):
+            r = per_file[int(fi)]
+            if len(r) == 0:
+                continue
+            blocks += [(int(fi), r[s:s + a.batch_size])
+                       for s in range(0, len(r), a.batch_size)]
+        cur_fi, Xcache = -1, None
+        for fi, idx in blocks:
             loss = 0.0
-            for fi in np.unique(ch[:, 0]):
-                d_ = data[fi]; idx = np.sort(ch[ch[:, 0] == fi, 1])
-                Xb = np.asarray(d_["X"][idx], dtype="float32"); Lb = d_["L"][idx]
+            d_ = data[fi]
+            if fi != cur_fi:
+                Xcache = d_["X"]; cur_fi = fi
+            if True:
+                Xb = np.asarray(Xcache[idx], dtype="float32"); Lb = d_["L"][idx]
                 m = np.arange(a.max_len)[None, :] >= \
                     (a.max_len - np.minimum(Lb, a.max_len))[:, None]
                 pr = np.zeros((len(idx), 3), dtype="float32")
@@ -200,11 +238,12 @@ def main() -> None:
         if tb is not None:
             tb.add_scalar("loss/pretrain2", tot / max(nb, 1), ep + 1)
         print(f"  эпоха {ep+1}/{a.epochs}  loss {tot/max(nb,1):.5f}  "
-              f"примеров {len(order):,}  {time.perf_counter()-t0:.0f}с", flush=True)
+              f"примеров {int(keep.sum()):,}  батчей {len(blocks)}  "
+              f"{time.perf_counter()-t0:.0f}с", flush=True)
         a.out.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"model": model.state_dict(), "cfg": cfg.__dict__,
                     "epoch": ep + 1, "queries": Q}, a.out)
-        del data; gc.collect()
+        gc.collect()
     print(f"сохранено {a.out}\nГОТОВО")
 
 
