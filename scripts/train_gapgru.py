@@ -86,10 +86,11 @@ class AnchorData:
     """Токены + базовый прогноз + цели одного якоря, выровненные по user_id."""
 
     def __init__(self, anchor: int, tok_dir: Path, oof_dir: Path, df=None,
-                 need_cycles: bool = False):
+                 need_cycles: bool = False, need_pm: bool = False):
         import polars as pl
         meta = np.load(tok_dir / f"meta_a{anchor}.npz")
-        oof = np.load(oof_dir / f"oof_a{anchor}.npz")
+        pm_file = oof_dir / f"oofpm_a{anchor}.npz"
+        oof = np.load(pm_file if pm_file.exists() else oof_dir / f"oof_a{anchor}.npz")
         tu, ou = meta["user_id"], oof["user_id"]
         # пересечение и порядок: молчаливое расхождение здесь дало бы
         # обучение на чужих остатках при формально корректном коде
@@ -107,6 +108,12 @@ class AnchorData:
         self.z0 = oof["z0"][oi].astype("float32")
         self.dis = (oof["z0_lgb"][oi] - oof["z0_cb"][oi]).astype("float32")
         self.z = np.log1p(oof["y"][oi]).astype("float32")
+        self.p0 = oof["p0"][oi].astype("float32") if "p0" in oof else None
+        self.m0 = oof["m0"][oi].astype("float32") if "m0" in oof else None
+        if need_pm and self.p0 is None:
+            raise FileNotFoundError(
+                f"для структурированных голов нужен {pm_file} с p0 и m0; "
+                f"соберите: python scripts/oof_pm.py")
         self.c = (oof["y"][oi] > 0).astype("float32")
         if df is not None:
             self.n_buy, self.n_ord = aux_targets(df, anchor, pl.Series("user_id", common))
@@ -164,7 +171,7 @@ def batches(datasets, bs, rng, feat_idx, shuffle=True, max_len=None,
 def to_torch(parts, feat_idx, dev, max_len):
     import torch
     Xs, gaps, ages, masks, priors, zs, z0s, cs, nbs, nos, cyc = ([] for _ in range(11))
-    grp = []
+    grp, pms = [], []
     gi, ai = feat_idx
     for gidx, (d, loc, X, C) in enumerate(parts):
         grp.append(np.full(len(loc), gidx, dtype="int64"))
@@ -176,12 +183,14 @@ def to_torch(parts, feat_idx, dev, max_len):
         ages.append(X[:, :, ai]); masks.append(m)
         priors.append(np.stack([d.z0[loc] - d.z0.mean(), d.dis[loc],
                                 np.log1p(L) - np.log1p(d.lengths).mean()], 1))
+        pms.append(np.stack([d.p0[loc], d.m0[loc]], 1) if d.p0 is not None
+                   else np.zeros((len(loc), 2), "float32"))
         zs.append(d.z[loc]); z0s.append(d.z0[loc]); cs.append(d.c[loc])
         nbs.append(d.n_buy[loc]); nos.append(d.n_ord[loc])
     T = lambda a, t=torch.float32: torch.as_tensor(np.concatenate(a), dtype=t, device=dev)
     return (T(Xs), T(gaps), T(ages), T(masks, torch.bool), T(priors),
             T(zs), T(z0s), T(cs), T(nbs), T(nos),
-            T(cyc) if cyc else None, T(grp, torch.int64), len(parts))
+            T(cyc) if cyc else None, T(grp, torch.int64), len(parts), T(pms))
 
 
 def main() -> None:
@@ -200,6 +209,9 @@ def main() -> None:
     ap.add_argument("--freeze-epochs", type=int, default=2,
                     help="эпох с замороженным энкодером после претрейна")
     ap.add_argument("--ckpt", type=Path, default=None)
+    ap.add_argument("--residual", choices=("z", "p", "m", "pm"), default="z",
+                    help="что исправляет сеть: z напрямую, вероятность покупки, "
+                         "условную сумму или обе части hurdle")
     ap.add_argument("--loss", choices=("mse", "dir"), default="mse",
                     help="mse — residual-MSE; dir — направленный Cov/sqrt(Var)")
     ap.add_argument("--accum", type=int, default=4,
@@ -248,7 +260,8 @@ def main() -> None:
     def get(anchor):
         if anchor not in cache:
             cache[anchor] = AnchorData(anchor, a.tokens, a.oof, df,
-                                       need_cycles=a.cycles)
+                                       need_cycles=a.cycles,
+                                       need_pm=(a.residual != "z"))
             print(f"  якорь {anchor}: {len(cache[anchor]):,} пользователей", flush=True)
         return cache[anchor]
 
@@ -301,7 +314,11 @@ def main() -> None:
                 raise FileNotFoundError(f"нет чекпоинта этапа A: {src}")
             sd = torch.load(src, map_location=dev)["model"]
             missing, unexpected = model.load_state_dict(sd, strict=False)
-            enc_missing = [k for k in missing if not k.startswith(("trunk", "head_dz"))]
+            # Головы, добавленные после сохранения чекпоинта, законно
+            # отсутствуют — они инициализируются нулями и учатся заново.
+            # Требуем присутствия только весов энкодера.
+            NEW_HEADS = ("trunk", "head_dz", "head_dp", "head_dm", "factor", "aux")
+            enc_missing = [k for k in missing if not k.startswith(NEW_HEADS)]
             if enc_missing:
                 raise RuntimeError(
                     f"в чекпоинте нет весов энкодера: {enc_missing[:5]} "
@@ -331,11 +348,18 @@ def main() -> None:
             with torch.no_grad():
                 for parts, fx in batches([d], 4096, rng, (gi, ai), shuffle=False,
                                          max_len=a.max_len):
-                    X, g, ag, m, pr, _z, _z0, _c, _nb, _no, cy, _gr, _ng = to_torch(
+                    X, g, ag, m, pr, _z, _z0, _c, _nb, _no, cy, _gr, _ng, pm0 = to_torch(
                         parts, fx, dev, a.max_len)
-                    out.append(model(X, g, ag, m, pr,
-                                     cycles=cy if a.cycles else None)[0]
-                               .float().cpu().numpy())
+                    dzo, auxo = model(X, g, ag, m, pr,
+                                      cycles=cy if a.cycles else None)
+                    if a.residual != "z":
+                        p0 = pm0[:, 0].clamp(1e-6, 1 - 1e-6); m0 = pm0[:, 1]
+                        lp = torch.log(p0 / (1 - p0))
+                        pn = torch.sigmoid(lp + (auxo["dp"] if a.residual in ("p", "pm") else 0.0))
+                        mn = m0 + (auxo["dm"] if a.residual in ("m", "pm") else 0.0)
+                        # d = p*m - p0*m0 — точная разность склеек
+                        dzo = pn * mn.clamp(min=0.0) - p0 * m0
+                    out.append(dzo.float().cpu().numpy())
             model.train()
             return np.concatenate(out)
 
@@ -372,12 +396,26 @@ def main() -> None:
             for parts, fx in batches(pool, cfg.batch_size, rng, (gi, ai),
                                      max_len=a.max_len,
                                      homogeneous=(a.loss == "dir")):
-                X, g, ag, m, pr, z, z0, c, nbuy, nord, cy, grp, ngrp = to_torch(
+                X, g, ag, m, pr, z, z0, c, nbuy, nord, cy, grp, ngrp, pm0 = to_torch(
                     parts, fx, dev, a.max_len)
                 if a.loss != "dir":
                     opt.zero_grad(set_to_none=True)
                 dz, aux = model(X, g, ag, m, pr, cycles=cy if a.cycles else None)
-                if a.loss == "dir":
+                if a.residual != "z":
+                    p0 = pm0[:, 0].clamp(1e-6, 1 - 1e-6); m0 = pm0[:, 1]
+                    lp = torch.log(p0 / (1 - p0))
+                    loss = 0.0
+                    if a.residual in ("p", "pm"):
+                        # смещение к логиту базовой вероятности, цель — факт покупки
+                        loss = loss + nn.functional.binary_cross_entropy_with_logits(
+                            lp + aux["dp"], c)
+                    if a.residual in ("m", "pm"):
+                        # условная сумма только на покупавших
+                        pos = c > 0.5
+                        if pos.any():
+                            loss = loss + ((m0[pos] + aux["dm"][pos] - z[pos]) ** 2).mean()
+                    loss = loss + cfg.aux_weights["p"] * bce(aux["p"], c)
+                elif a.loss == "dir":
                     # штраф на масштаб здесь не нужен и вреден: целевая
                     # функция инвариантна к масштабу по построению
                     loss = (directional_loss(z - z0, dz, grp, ngrp)

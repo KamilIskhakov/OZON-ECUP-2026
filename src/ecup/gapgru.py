@@ -170,6 +170,15 @@ def make_model(cfg: GapGRUConfig):
             self.trunk = nn.Sequential(*layers)
             self.head_dz = nn.Linear(d, 1)
             nn.init.zeros_(self.head_dz.weight); nn.init.zeros_(self.head_dz.bias)
+            # Структурированные поправки. Тождество E[z|x] = p*m точное,
+            # поэтому ошибка базы факторизуется строго: (p-p0)m0 + p0(m-m0)
+            # + (p-p0)(m-m0). Одна голова получает их смесь в одном шумном
+            # числе и должна разбираться сама; две — разные градиенты.
+            # Обе с нулевой инициализацией: на старте модель тождественна базе.
+            self.head_dp = nn.Linear(d, 1)
+            self.head_dm = nn.Linear(d, 1)
+            for h_ in (self.head_dp, self.head_dm):
+                nn.init.zeros_(h_.weight); nn.init.zeros_(h_.bias)
             self.aux = nn.ModuleDict({k: nn.Linear(d, 1) for k in cfg.aux_weights})
             # Голова фактора видит только свой контекст размерности dh.
             self.factor = nn.ModuleDict({
@@ -206,6 +215,8 @@ def make_model(cfg: GapGRUConfig):
             z = self.trunk(joined)
             dz = self.head_dz(z).squeeze(-1)
             aux = {k: head(z).squeeze(-1) for k, head in self.aux.items()}
+            aux["dp"] = self.head_dp(z).squeeze(-1)
+            aux["dm"] = self.head_dm(z).squeeze(-1)
             if factor_out:
                 # (B, nq, dh) — контекст каждого запроса по отдельности
                 ctx = c.view(B, self.nq, -1)
