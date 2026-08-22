@@ -77,7 +77,7 @@ def monetary_features(df: pl.DataFrame, anchor: int,
     S = S.with_columns(
         _sxx=pl.col('_wxx') - pl.col('_w') * pl.col('_mx')**2,
         _sxy=pl.col('_wxy') - pl.col('_w') * pl.col('_mx') * pl.col('_my'))
-    g2 = (S.with_columns(gv_beta=pl.col('_sxy') / (LAM + pl.col('_sxx')),
+    g2 = (S.with_columns(gv_beta=pl.col('_sxy') / (pl.col('_sxx') + LAM),
                          gv_cov=pl.col('_sxy') / (pl.col('_w') + 1e-9),
                          gv_xbar=pl.col('_mx'), gv_ybar=pl.col('_my'))
            .select('user_id', 'gv_n', 'gv_gap_med', 'gv_beta', 'gv_cov',
@@ -105,7 +105,11 @@ def monetary_features(df: pl.DataFrame, anchor: int,
             .join(cur, on='user_id', how='left')
             .with_columns([pl.col(c).fill_null(0.0) for c in
                            ('cy_s_now', 'cy_c_now', 'cy_a_now')])
-            .with_columns(cy_r=(anchor - pl.col('last_buy')).cast(pl.Float64)))
+            # pl.lit слева обязателен: `anchor - pl.col(...)` зовёт
+            # Expr.__rsub__, и polars уводит это в UDF без объявленного
+            # типа возврата, отказываясь затем его исполнять
+            .with_columns(cy_r=(pl.lit(anchor) - pl.col('last_buy'))
+                          .cast(pl.Float64)))
 
     out = (g1.join(g2, on='user_id', how='left')
              .join(g3, on='user_id', how='left'))
