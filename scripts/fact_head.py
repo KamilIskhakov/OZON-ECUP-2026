@@ -38,10 +38,14 @@ def counts(a):
 
 
 def reg(X, y, w, n, seed=42):
+    # сид передаётся как random_state ОТДЕЛЬНЫМ аргументом: в reg_params
+    # его нет, ModelConfig хранит его самостоятельным полем. Без этого
+    # bagging_fraction и feature_fraction получают дефолтный сид, и все
+    # «разные сиды» дают побитово одинаковый лес.
     p = dict(ModelConfig(seed=seed).reg_params)
     p.update(n_estimators=n, verbose=-1, n_jobs=-1)
     p.pop('early_stopping_rounds', None)
-    return lgb.LGBMRegressor(**p).fit(X, y, sample_weight=w)
+    return lgb.LGBMRegressor(random_state=seed, **p).fit(X, y, sample_weight=w)
 
 
 def wmean(v, w):
