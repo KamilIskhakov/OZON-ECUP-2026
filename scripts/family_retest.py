@@ -20,6 +20,7 @@ from ecup import (SplitConfig, ModelConfig, HurdleGBDT, load_panel, build_anchor
 from ecup.dataset import anchor_offsets
 from ecup.percentile import add_percentiles
 from ecup.monetary import monetary_features
+from ecup.simple_features import simple_features
 
 ANCH = (318, 348); SEEDS = (42, 7, 2026, 13, 99, 123)
 FAM = sys.argv[1] if len(sys.argv) > 1 else 'pct'
@@ -28,10 +29,10 @@ FAM = sys.argv[1] if len(sys.argv) > 1 else 'pct'
 def add_family(X, ids):
     if FAM == 'pct':
         return add_percentiles(X, ids)
+    fn = {'mon': monetary_features, 'simple': simple_features}[FAM]
     Z = X.with_columns(_aid=pl.Series(ids),
                        _row=pl.int_range(pl.len(), dtype=pl.UInt32))
-    p = [Z.filter(pl.col('_aid') == a).join(monetary_features(df, a),
-                                            on='user_id', how='left')
+    p = [Z.filter(pl.col('_aid') == a).join(fn(df, a), on='user_id', how='left')
          for a in sorted(set(ids))]
     return (pl.concat(p, how='vertical_relaxed').sort('_row')
               .drop('_aid', '_row').fill_null(0.0))
