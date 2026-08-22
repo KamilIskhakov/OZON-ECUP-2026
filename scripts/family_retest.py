@@ -60,7 +60,7 @@ for A in ANCH:
               ' '.join(f'{v:.5f}' for v in P[name]) +
               f' · {time.perf_counter()-t0:.0f}с', flush=True)
         del Xtr, Xva; gc.collect()
-    d = np.array(P['base']) - np.array(P['pct']); D.append(d)
+    d = np.array(P['base']) - np.array(P[FAM]); D.append(d)
     print(f'  разности ' + ' '.join(f'{v:+.5f}' for v in d) +
           f' · среднее {d.mean():+.5f}', flush=True)
     del Xd, val; gc.collect()
