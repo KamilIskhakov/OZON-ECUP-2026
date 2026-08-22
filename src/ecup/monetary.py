@@ -25,8 +25,8 @@ BIG_K = 1.5       # порог крупной покупки в MAD от мед�
 
 def monetary_features(df: pl.DataFrame, anchor: int,
                       max_history: int = 300) -> pl.DataFrame:
-    lo = anchor - max_history
-    win = df.filter((pl.col('d') >= lo) & (pl.col('d') < anchor))
+    lo = anchor - max_history + 1
+    win = df.filter(pl.col('d').is_between(lo, anchor))
     buys = (win.filter(pl.col('gmv') > 0)
                .select('user_id', 'd', 'gmv', 'to_ord')
                .sort('user_id', 'd')

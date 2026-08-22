@@ -25,7 +25,7 @@ HALFLIVES = (60.0, 180.0)
 
 def global_shock(df: pl.DataFrame, upto: int, win: int = 28) -> pl.DataFrame:
     """Дневной шок спроса по всем пользователям, только по дням < upto."""
-    g = (df.filter(pl.col('d') < upto)
+    g = (df.filter(pl.col('d') <= upto)
            .group_by('d').agg(pl.col('gmv').sum().alias('G'),
                               pl.col('dow').first().alias('dow'))
            .sort('d')
@@ -43,8 +43,8 @@ def shock_betas(df: pl.DataFrame, anchor: int, max_history: int = 300,
                 lam: float = 1.0) -> pl.DataFrame:
     """По одному beta на пару (величина, период полураспада)."""
     g = global_shock(df, anchor)
-    lo = anchor - max_history
-    s = (df.filter((pl.col('d') >= lo) & (pl.col('d') < anchor))
+    lo = anchor - max_history + 1
+    s = (df.filter(pl.col('d').is_between(lo, anchor))
            .join(g.filter(pl.col('d') >= lo), on='d', how='inner'))
     out = None
     for hl in HALFLIVES:

@@ -19,8 +19,8 @@ A_SMOOTH, B_SMOOTH = 1.0, 5.0
 
 
 def intent_stock(df: pl.DataFrame, anchor: int, max_history: int = 300) -> pl.DataFrame:
-    lo = anchor - max_history
-    s = df.filter((pl.col('d') >= lo) & (pl.col('d') < anchor))
+    lo = anchor - max_history + 1
+    s = df.filter(pl.col('d').is_between(lo, anchor))
     long = (s.filter(pl.col('d') >= anchor - 180)
              .group_by('user_id').agg(S=pl.col('searches').sum(),
                                       C=pl.col('to_cart').sum(),

@@ -24,14 +24,17 @@ HORIZON = 30
 
 def simple_features(df: pl.DataFrame, anchor: int,
                     max_history: int = 300) -> pl.DataFrame:
-    lo = anchor - max_history
-    w = df.filter((pl.col('d') >= lo) & (pl.col('d') < anchor))
+    # день A ВКЛЮЧЁН: канон в features.py — is_between(A-max+1, A),
+    # а цель начинается с A+1. Исключение дня A теряло самый свежий
+    # день ровно у возрастов и серий, ради которых блок и строится.
+    lo = anchor - max_history + 1
+    w = df.filter(pl.col('d').is_between(lo, anchor))
     uid = w.select('user_id').unique()
 
     # ---------- 2. профиль по дням недели, выровненный на цель ----------
-    days = np.arange(lo, anchor)
+    days = np.arange(lo, anchor + 1)
     hist_cnt = np.bincount(days % 7, minlength=7).astype('float64')
-    tgt = np.arange(anchor, anchor + HORIZON)
+    tgt = np.arange(anchor + 1, anchor + HORIZON + 1)   # цель — (A, A+30]
     tgt_cnt = np.bincount(tgt % 7, minlength=7).astype('float64')
     per = (w.group_by('user_id', 'dow').agg(
                nb=(pl.col('gmv') > 0).sum().cast(pl.Float64),
