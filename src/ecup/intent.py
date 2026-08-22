@@ -12,7 +12,7 @@
 намерения над тем, что уже успело пройти дальше по воронке.
 """
 from __future__ import annotations
-import polars as pl
+import numpy as np, polars as pl
 
 HALFLIVES = (3.0, 7.0, 21.0)
 A_SMOOTH, B_SMOOTH = 1.0, 5.0
@@ -30,7 +30,8 @@ def intent_stock(df: pl.DataFrame, anchor: int, max_history: int = 300) -> pl.Da
              .select('user_id', 'r_CO', 'r_SC'))
     aggs = []
     for hl in HALFLIVES:
-        w = 0.5 ** ((anchor - pl.col('d')) / hl); h = int(hl)
+        # см. комментарий в shocks.py: exp вместо 0.5 ** expr
+        w = ((pl.col('d') - anchor) * (np.log(2.0) / hl)).exp(); h = int(hl)
         aggs += [(w*pl.col('searches')).sum().alias(f'_S{h}'),
                  (w*pl.col('to_cart')).sum().alias(f'_C{h}'),
                  (w*pl.col('to_ord')).sum().alias(f'_O{h}')]

@@ -15,6 +15,10 @@
 from __future__ import annotations
 import numpy as np, polars as pl
 
+# затухание через exp, а не 0.5 ** expr: во втором случае Python зовёт
+# float.__pow__ с выражением polars, и это уходит в UDF без объявленного
+# типа возврата, который polars 1.43 отказывается выполнять
+
 QCOLS = ('searches', 'to_cart', 'to_ord', 'gmv')
 HALFLIVES = (60.0, 180.0)
 
@@ -44,7 +48,7 @@ def shock_betas(df: pl.DataFrame, anchor: int, max_history: int = 300,
            .join(g.filter(pl.col('d') >= lo), on='d', how='inner'))
     out = None
     for hl in HALFLIVES:
-        w = (0.5 ** ((anchor - pl.col('d')) / hl))
+        w = ((pl.col('d') - anchor) * (np.log(2.0) / hl)).exp()
         agg = [(w * pl.col('gt') * pl.col(c)).sum().alias(f'shk_{c}_{int(hl)}')
                for c in QCOLS]
         # знаменатель: нормировка на собственную энергию пользователя,
@@ -55,5 +59,5 @@ def shock_betas(df: pl.DataFrame, anchor: int, max_history: int = 300,
         r = r.with_columns([(pl.col(f'shk_{c}_{int(hl)}') /
                              pl.col(f'_nrm_{c}_{int(hl)}')).alias(f'shk_{c}_{int(hl)}')
                             for c in QCOLS]).drop([f'_nrm_{c}_{int(hl)}' for c in QCOLS])
-        out = r if out is None else out.join(r, on='user_id', how='outer_coalesce')
+        out = r if out is None else out.join(r, on='user_id', how='left')
     return out
