@@ -99,3 +99,70 @@ def market_features(df: pl.DataFrame, anchor: int, users: np.ndarray,
     # недавний темп против пожизненного — отношение, а не два уровня
     add('life_rel_recent', rel[90] - np.log1p(fg / span))
     return np.column_stack(cols).astype('float32'), names
+
+
+# --- чистая версия: систематическая нормировка накопительных величин ---
+#
+# Дефекты первой версии, найденные при разборе:
+#   life_aov       считался как GMV/buydays, а не GMV/orders;
+#   life_act_frac  мерил долю дней с ПОИСКОМ, а не активность пайплайна;
+#   life_rel_recent непрозрачная смесь единиц;
+#   rel_*          рыночный блок дал ноль на обоих якорях.
+#
+# Определения приведены к пайплайну: активный день — день присутствия
+# в панели (в features.py это pl.len()), покупочный — день с gmv > 0.
+#
+# Два охвата. `full` — все дни 0..T, то есть БЕЗ обрезки max_history.
+# `capped` — последние 300 дней, то есть ровно то, что видит боевая
+# модель. Сравнение двух охватов разделяет два механизма: если capped
+# даёт почти столько же, дело было в единицах измерения; если прирост
+# только у full — в старой истории есть новый сигнал.
+
+CAP = 300
+
+
+def rate_features(df: pl.DataFrame, anchor: int, users: np.ndarray,
+                  scopes: tuple[str, ...] = ('full', 'capped')
+                  ) -> tuple[np.ndarray, list[str]]:
+    base = pl.DataFrame({'user_id': users})
+    cols: list[np.ndarray] = []
+    names: list[str] = []
+    for sc in scopes:
+        lo = 0 if sc == 'full' else max(0, anchor - CAP + 1)
+        days = float(anchor - lo + 1)
+        a = (df.filter(pl.col('d').is_between(lo, anchor)).group_by('user_id')
+               .agg(g=pl.col('gmv').sum().cast(pl.Float64),
+                    o=pl.col('to_ord').sum().cast(pl.Float64),
+                    c=pl.col('to_cart').sum().cast(pl.Float64),
+                    s=pl.col('searches').sum().cast(pl.Float64),
+                    bd=(pl.col('gmv') > 0).sum().cast(pl.Float64),
+                    ad=pl.len().cast(pl.Float64),
+                    fd=pl.col('d').min().cast(pl.Float64)))
+        j = base.join(a, on='user_id', how='left')
+        g = j['g'].fill_null(0.0).to_numpy(); o = j['o'].fill_null(0.0).to_numpy()
+        c = j['c'].fill_null(0.0).to_numpy(); s = j['s'].fill_null(0.0).to_numpy()
+        bd = j['bd'].fill_null(0.0).to_numpy(); ad = j['ad'].fill_null(0.0).to_numpy()
+        fd = j['fd'].to_numpy().astype('float64')
+        ten = np.where(np.isfinite(fd), anchor - fd, 0.0)
+        for nm_, v in (
+            ('gmv_per_day', np.log1p(g / days)),
+            ('ord_per_day', np.log1p(o / days)),
+            ('cart_per_day', np.log1p(c / days)),
+            ('srch_per_day', np.log1p(s / days)),
+            ('buyday_frac', bd / days),
+            ('actday_frac', ad / days),
+            ('gmv_per_buyday', np.log1p(g / np.maximum(bd, 1.0))),
+            ('aov', np.log1p(g / np.maximum(o, 1.0))),
+            ('ord_per_buyday', o / np.maximum(bd, 1.0)),
+            ('tenure_frac', ten / days),
+        ):
+            cols.append(np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0))
+            names.append(f'{sc[0]}_{nm_}')
+    return np.column_stack(cols).astype('float32'), names
+
+
+def gmv_rate_only(df: pl.DataFrame, anchor: int, users: np.ndarray,
+                  scope: str) -> np.ndarray:
+    """Один признак GMV/день для теста механизма capped против full."""
+    v, _ = rate_features(df, anchor, users, scopes=(scope,))
+    return v[:, :1]
