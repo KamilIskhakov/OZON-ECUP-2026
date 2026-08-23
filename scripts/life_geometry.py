@@ -26,8 +26,10 @@ from ecup import (SplitConfig, ModelConfig, load_panel, build_anchor,
 from ecup.dataset import anchor_offsets
 from ecup.model import HurdleGBDT
 from ecup.catboost_model import CatBoostConfig, HurdleCatBoost
-from ecup.market import market_features, _market
+from ecup.market import market_features, rate_features, _market
 
+import os
+BLOCK = os.environ.get('BLOCK', 'life')
 A = 378; O = Path('artifacts/neural'); HIST = (240, 300, 365); SEEDS = (42, 7)
 W_LGB, W_CB = 0.4, 0.6
 df = load_panel(); mkt = _market(df)
@@ -39,19 +41,23 @@ for h in HIST:
     Xd, y, aid, lv = build_training_set(df, an, sp, None, verbose=False)
     w = anchor_weights(aid); ci, zo = anchor_offsets(aid, lv); last = lv[max(an)]
     X, feats = to_matrix(Xd); uid_tr = Xd['user_id'].to_numpy(); del Xd; gc.collect()
+    def block(a_, u_):
+        if BLOCK == 'life':
+            B_, nm_ = market_features(df, a_, u_, mkt)
+            k_ = [i for i, c in enumerate(nm_) if c.startswith('life_')]
+            return B_[:, k_], [nm_[i] for i in k_]
+        return rate_features(df, a_, u_, scopes=('full',))
     NEW = None
     for a in sorted(set(aid)):
         m = aid == a
-        B, nm = market_features(df, int(a), uid_tr[m], mkt)
+        B, nm_l = block(int(a), uid_tr[m])
         if NEW is None:
-            keep = [i for i, c in enumerate(nm) if c.startswith('life_')]
-            nm_l = [nm[i] for i in keep]
-            NEW = np.zeros((len(y), len(keep)), dtype='float32')
-        NEW[m] = B[:, keep]
+            NEW = np.zeros((len(y), B.shape[1]), dtype='float32')
+        NEW[m] = B
     val = build_anchor(df, A, sp, None); Xva, _ = to_matrix(val.X, feats)
     uid = val.X['user_id'].to_numpy()
-    Bva, _ = market_features(df, A, uid, mkt)
-    X2 = np.hstack([X, NEW]); Xva2 = np.hstack([Xva, Bva[:, keep]]); f2 = feats + nm_l
+    Bva, _ = block(A, uid)
+    X2 = np.hstack([X, NEW]); Xva2 = np.hstack([Xva, Bva]); f2 = feats + nm_l
     print(f'\n=== история {h} · якорей {len(an)} ===', flush=True)
     for s in SEEDS:
         for fam in ('lgb', 'cb'):
@@ -87,7 +93,7 @@ d16 = np.load(O / f'dz_a{A}.npz')['dz']; dann = np.load(f'/tmp/d_annual_{A}.npy'
 CORR = 0.35 * (d16 - d16.mean()) + 0.0104 * (dann - dann.mean())
 z_v23 = 0.4 * zl_saved + 0.6 * zc + CORR
 e = z - z_v23
-print(f'\nshape точного v23 на {A}: {e.std():.5f}', flush=True)
+print(f'\nБЛОК {BLOCK} · shape точного v23 на {A}: {e.std():.5f}', flush=True)
 
 D = np.column_stack([d16 - d16.mean(), dann - dann.mean()])
 dl = d_life - d_life.mean()
@@ -105,5 +111,5 @@ print(f'  ортогональная доля {dp.std()/dl.std():.4f} · '
       f'corr(d_life, annual) {np.corrcoef(dl, dann)[0,1]:+.4f}')
 print(f'\nпри применении с alpha = 1: shape '
       f'{float((e - dl).std()):.5f} против {e.std():.5f}', flush=True)
-np.savez_compressed(O / f'life_geom_a{A}.npz', user_id=ref, d_life=d_life, e=e, z_v23=z_v23)
+np.savez_compressed(O / f'{BLOCK}_geom_a{A}.npz', user_id=ref, d_life=d_life, e=e, z_v23=z_v23)
 print('готово', flush=True)
