@@ -4,9 +4,18 @@
   H   горизонт          3 x 200 на Y[1:10], Y[11:20], Y[21:30]
   S   канал             2 x 300 на Y_search и Y_cat
 
-В обоих случаях прогнозы суммируются в ИСХОДНОЙ шкале, затем log1p.
-Это не тождественная RMSLE-факторизация, поэтому никаких ожиданий
-заранее — только парный тест при равном бюджете деревьев.
+Подцелевые прогнозы НЕ суммируются в исходной шкале: expm1 от
+E[log(1+Y_k)|X] даёт величину порядка условной медианы, а не среднего,
+и при 40 % нулей в декаде разрыв Йенсена огромен — первая версия
+этого эксперимента померила именно его (-0.014 при t = -171), а не
+гипотезу. Вместо этого подцелевые прогнозы служат входами линейного
+комбинатора, обученного на тех же обучающих якорях:
+
+    m = alpha_0 + sum_k alpha_k * p_k
+
+Он сам находит нужный масштаб в лог-шкале, поэтому вопрос Йенсена
+снимается тождественно. Четыре параметра на сотни тысяч строк —
+переобучение комбинатора пренебрежимо.
 
 Механизм для горизонта: связь недавнего поведения с GMV через три дня
 и через двадцать семь почти наверняка разная, а сейчас одна голова
@@ -61,14 +70,40 @@ for A in ANCH:
         print(f'  {c}: доля нулей среди покупателей {(sub[c] < 1e-9).mean():.3f}', flush=True)
     print(f'=== якорь {A} · обучающие {an} ===', flush=True)
 
+    def combine(cols, cap, s):
+        tr, va = [], []
+        for c in cols:
+            m = reg(Xp, sub[c], wp, cap, s)
+            tr.append(m.predict(Xp)); va.append(m.predict(Xva))
+        Atr = np.column_stack([np.ones(len(zp))] + tr)
+        Ava = np.column_stack([np.ones(len(Xva))] + va)
+        G = (Atr * wp[:, None]).T @ Atr
+        al = np.linalg.solve(G, (Atr * wp[:, None]).T @ np.log1p(y[pos]))
+        return Ava @ al, al
+
     R = {}
     for s in SEEDS:
         t0 = time.perf_counter()
         R[f'A_{s}'] = reg(Xp, zp, wp, BUDGET, s).predict(Xva) + last.l_plus
-        R[f'H_{s}'] = np.log1p(sum(np.clip(np.expm1(
-            reg(Xp, sub[c], wp, BUDGET // 3, s).predict(Xva)), 0, None) for c in cols_h))
-        R[f'S_{s}'] = np.log1p(sum(np.clip(np.expm1(
-            reg(Xp, sub[c], wp, BUDGET // 2, s).predict(Xva)), 0, None) for c in cols_s))
+        R[f'H_{s}'], ah = combine(cols_h, BUDGET // 3, s)
+        R[f'S_{s}'], as_ = combine(cols_s, BUDGET // 2, s)
+        # аддитивная склейка с поправкой масштаба: Y = Y_s + Y_c верно в
+        # ИСХОДНОЙ шкале, поэтому лог-линейный комбинатор для канала
+        # неверно специфицирован. Поправка c_k снимает смещение Йенсена,
+        # оставляя правильную функциональную форму.
+        for nm, cols, cap in (('HA', cols_h, BUDGET // 3), ('SA', cols_s, BUDGET // 2)):
+            acc = np.zeros(len(Xva))
+            for c in cols:
+                m = reg(Xp, sub[c], wp, cap, s)
+                ptr = np.clip(np.expm1(m.predict(Xp)), 0, None)
+                tgt = np.expm1(sub[c])
+                ck = float((tgt * wp).sum() / max((ptr * wp).sum(), 1e-9))
+                acc += ck * np.clip(np.expm1(m.predict(Xva)), 0, None)
+                if s == SEEDS[0]: print(f'    {nm}/{c}: c = {ck:.4f}', flush=True)
+            R[f'{nm}_{s}'] = np.log1p(acc)
+        if s == SEEDS[0]:
+            print(f'  комбинатор H {np.array2string(ah, precision=3)} · '
+                  f'S {np.array2string(as_, precision=3)}', flush=True)
         print(f'  сид {s} за {time.perf_counter()-t0:.0f}с', flush=True)
 
     o = np.load(O / f'oofpm_a{A}.npz')
@@ -79,7 +114,8 @@ for A in ANCH:
     sh = lambda k: float((zz - p0 * np.clip(b[k].to_numpy(), 0, None)).std())
     base = np.array([sh(f'A_{s}') for s in SEEDS])
     print(f'  A контроль      ' + ' '.join(f'{x:.5f}' for x in base), flush=True)
-    for nm, lab in (('H', 'горизонт 3x200'), ('S', 'канал 2x300')):
+    for nm, lab in (('H', 'горизонт комб.'), ('HA', 'горизонт сумма'),
+                    ('S', 'канал комб.'), ('SA', 'канал сумма')):
         f = np.array([sh(f'{nm}_{s}') for s in SEEDS]); d = base - f
         se = d.std(ddof=1) / np.sqrt(len(d))
         print(f'  {nm} {lab:<15}' + ' '.join(f'{x:.5f}' for x in f) +
