@@ -29,6 +29,8 @@ class TCNConfig:
     epochs: int = 12
     seed: int = 42
     lambda_delta: float = 0.05
+    direct: bool = False   # True — самостоятельный прогноз z, а не поправка
+    init_bias: float = 0.0
 
 
 class Block(nn.Module):
@@ -65,7 +67,13 @@ class DenseTCN(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(cfg.channels * 3 + cfg.n_prior, 128), nn.ReLU(),
             nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 1))
-        nn.init.zeros_(self.head[-1].weight); nn.init.zeros_(self.head[-1].bias)
+        if cfg.direct:
+            # Для самостоятельного прогноза нулевой старт бессмысленен:
+            # обычная инициализация весов, смещение — в среднее z.
+            nn.init.constant_(self.head[-1].bias, cfg.init_bias)
+        else:
+            # Для поправки нулевой старт даёт тождественное равенство базе.
+            nn.init.zeros_(self.head[-1].weight); nn.init.zeros_(self.head[-1].bias)
 
     def forward(self, x, prior):
         h = self.inp(x.transpose(1, 2))

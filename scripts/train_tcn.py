@@ -1,4 +1,23 @@
-"""TCN на плотной решётке, прямое предсказание z.
+"""TCN на плотной решётке, НАСТОЯЩЕЕ прямое предсказание z.
+
+ПОПРАВКА К ПРЕДЫДУЩЕМУ ЗАПУСКУ. Там стояло
+
+    zh = model(x, pr) + z0;  loss = mse(zh, z)
+
+что тождественно E[(f(X) - (z - z0))^2], то есть ВСЁ ТО ЖЕ обучение на
+остатке, только без штрафа. Он был назван прямым предсказанием z, и на
+его основании ветка закрывалась — вывод преждевременный: сравнивались
+остаточная модель со штрафом и остаточная без него.
+
+Здесь модель выдаёт сам прогноз:
+
+    zh = model(x, prior);  loss = mse(zh, z)
+
+Соответственно z0 входит в prior как АБСОЛЮТНАЯ величина (легитимный
+признак для самостоятельного прогноза, а не смещение), а голова не
+инициализируется нулями — смещение ставится в среднее z.
+
+Направлением служит d = z_TCN - z0, и alpha подбирается как всегда.
 
 ПЕРВАЯ ПОПЫТКА обучала на остатке e = z - z0 и схлопнулась в ноль:
 std(dz) выросла до 0.005 на двадцатом шаге и вернулась к нулю к сотому.
@@ -36,7 +55,7 @@ from ecup.dense_tcn import TCNConfig, make_tcn
 
 O = Path('artifacts/neural'); D = O / 'dense'
 TR = [258, 288, 318]; WA = [0.5, 0.7, 1.0]; AL, TE = 348, 378
-cfg = TCNConfig()
+cfg = TCNConfig(direct=True)
 dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'устройство {dev}', flush=True)
 
@@ -55,8 +74,9 @@ class Anchor:
         self.dis = (o['z0_lgb'][oi] - o['z0_cb'][oi]).astype('float32')
         self.act = np.asarray(self.X[keep][:, :, 0]).sum(1).astype('float32')
         self.uid = uid[keep]
-        self.prior = np.stack([self.z0 - self.z0.mean(), self.dis,
-                               np.log1p(self.act) - np.log1p(self.act).mean()], 1)
+        # Абсолютный z0: для самостоятельного прогноза это признак,
+        # а не смещение, поэтому центрировать его не нужно.
+        self.prior = np.stack([self.z0, self.dis, np.log1p(self.act)], 1)
         print(f'  якорь {A}: {len(keep):,}', flush=True)
 
     def batch(self, sl):
@@ -68,6 +88,8 @@ class Anchor:
 
 
 tr = [Anchor(a) for a in TR]; da = Anchor(AL); dt = Anchor(TE)
+cfg.init_bias = float(np.concatenate([d.z for d in tr]).mean())
+print(f'смещение головы в среднее z = {cfg.init_bias:.4f}', flush=True)
 model = make_tcn(cfg).to(dev)
 opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
 n_par = sum(p.numel() for p in model.parameters())
@@ -82,12 +104,13 @@ with torch.no_grad():
 
 @torch.no_grad()
 def predict(d):
+    """Возвращает НАПРАВЛЕНИЕ d = z_TCN - z0, сопоставимое со стеком."""
     model.eval(); out = []
     for s in range(0, len(d.z), 512):
         sl = slice(s, min(s + 512, len(d.z)))
         x, pr, _, _ = d.batch(sl)
         out.append(model(x, pr).float().cpu().numpy())
-    return np.concatenate(out)
+    return np.concatenate(out) - d.z0
 
 
 best = {'gain': -1e9, 'ep': 0, 'state': None}
@@ -100,7 +123,7 @@ for ep in range(cfg.epochs):
     for gi, s in order:
         d = tr[gi]; sl = slice(s, min(s + cfg.batch_size, len(d.z)))
         x, pr, z, z0 = d.batch(sl)
-        zh = model(x, pr) + z0        # база как смещение, а не как цель
+        zh = model(x, pr)             # САМ прогноз, без прибавления базы
         loss = mse(zh, z) * WA[gi]
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -135,7 +158,7 @@ base = float(et.std()); got = float((et - alpha * dz_t).std())
 print(f'\nна {AL} (подбор alpha): выигрыш {best["gain"]:+.5f} · alpha {alpha:+.4f}')
 print(f'на {TE} (оценка):   {base:.5f} -> {got:.5f}  выигрыш {base-got:+.5f}')
 print(f'перенос: {100*(base-got)/max(best["gain"],1e-9):.0f}%')
-np.savez_compressed(O / 'tcn_dz_a378.npz', user_id=dt.uid, dz=dz_t, z0=dt.z0, z=dt.z)
+np.savez_compressed(O / 'tcn_direct_dz_a378.npz', user_id=dt.uid, dz=dz_t, z0=dt.z0, z=dt.z)
 torch.save({'model': model.state_dict(), 'epoch': best['ep']},
            O / 'weights' / 'tcn_fold.pt')
 print(f'\nшлюз: Delta_378 > 3e-4 · '
