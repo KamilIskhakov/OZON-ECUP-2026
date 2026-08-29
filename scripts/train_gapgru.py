@@ -108,6 +108,13 @@ class AnchorData:
         self.z0 = oof["z0"][oi].astype("float32")
         self.dis = (oof["z0_lgb"][oi] - oof["z0_cb"][oi]).astype("float32")
         self.z = np.log1p(oof["y"][oi]).astype("float32")
+        # Ортогональная цель: z подменяется на z0 + r_orth, где r_orth —
+        # ошибка вне оболочки уже найденных направлений. Подменяется именно
+        # ЦЕЛЬ, а не z0: последний входит в prior и на боевом якоре должен
+        # оставаться вычислимым. Флаги покупки и вспомогательные счётчики
+        # по-прежнему берутся из настоящего y.
+        if "z_override" in oof:
+            self.z = oof["z_override"][oi].astype("float32")
         self.p0 = oof["p0"][oi].astype("float32") if "p0" in oof else None
         self.m0 = oof["m0"][oi].astype("float32") if "m0" in oof else None
         if need_pm and self.p0 is None:
@@ -198,12 +205,21 @@ def main() -> None:
     ap.add_argument("--tokens", type=Path, default=Path("artifacts/neural/tokens"))
     ap.add_argument("--oof", type=Path, default=Path("artifacts/neural"))
     ap.add_argument("--max-len", type=int, default=192)
+    ap.add_argument("--hidden", type=int, default=96,
+                    help="ширина скрытого состояния GRU")
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--lambda-delta", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--fold", type=int, default=-1, help="-1 = оба")
+    ap.add_argument("--anchor-weights", default=None,
+                    help="веса обучающих якорей через запятую, в порядке "
+                         "их перечисления; защита от того, чтобы старый "
+                         "режим остатка доминировал над свежим")
+    ap.add_argument("--folds", default=None,
+                    help="свои фолды: тренировочные/альфа/тест через :, "
+                         "например 318:348:378")
     ap.add_argument("--init-from", type=Path, default=None,
                     help="чекпоинт этапа A; ищется как <путь>_fold{i}.pt")
     ap.add_argument("--freeze-epochs", type=int, default=2,
@@ -277,9 +293,28 @@ def main() -> None:
     # Для прогноза на 408 это чистая потеря. Число эпох и α сюда переносятся
     # из фолдового прогона — подбирать их здесь не на чем, и это осознанное
     # ограничение режима, а не упущение.
-    folds = ([(TRAIN_ANCHORS + [VAL_ANCHOR], None, None)] if a.production
-             else FOLDS if a.fold < 0 else [FOLDS[a.fold]])
+    if a.folds:
+        _tr, _al, _te = a.folds.split(':')
+        if not _al or not _te:
+            # Пустые альфа/тест означают боевой режим на своих якорях:
+            # боевой аналог выигравшей конфигурации — те же три поздних
+            # среза, сдвинутые вперёд на один шаг.
+            a.production = True
+            folds = [([int(x) for x in _tr.split(',')], None, None)]
+        else:
+            folds = [([int(x) for x in _tr.split(',')], int(_al), int(_te))]
+    else:
+        folds = ([(TRAIN_ANCHORS + [VAL_ANCHOR], None, None)] if a.production
+                 else FOLDS if a.fold < 0 else [FOLDS[a.fold]])
     for fi, (tr_anchors, alpha_anchor, test_anchor) in enumerate(folds):
+        _AW = None
+        if a.anchor_weights:
+            import torch as _t
+            _w = [float(x) for x in a.anchor_weights.split(',')]
+            assert len(_w) == len(tr_anchors), (
+                f'весов {len(_w)}, обучающих якорей {len(tr_anchors)}')
+            _AW = _t.tensor(_w, dtype=_t.float32, device=pick_device())
+            print(f"  веса якорей: {dict(zip(tr_anchors, _w))}", flush=True)
         if a.production:
             print(f"\n=== боевой режим: обучение {tr_anchors}, оценки нет ===",
                   flush=True)
@@ -310,6 +345,7 @@ def main() -> None:
             if src.exists():
                 qs = tuple(torch.load(src, map_location="cpu").get("queries", qs))
         cfg = GapGRUConfig(n_features=len(TOKEN_FEATURES) - 2, max_len=a.max_len,
+                           hidden=a.hidden,
                            lambda_delta=a.lambda_delta, lr=a.lr,
                            batch_size=a.batch_size, epochs=a.epochs, seed=a.seed,
                            use_cycles=a.cycles, queries=qs)
@@ -472,6 +508,11 @@ def main() -> None:
                             + a.lambda_mse * mse(z0 + dz, z))
                 else:
                     loss = mse(z0 + dz, z) + cfg.lambda_delta * (dz ** 2).mean()
+                    # Батчи однородны по якорю, поэтому вес берётся по первой
+                    # строке. Веса НЕ подбираются, это грубая защита от
+                    # доминирования старых режимов остатка.
+                    if _AW is not None:
+                        loss = loss * _AW[grp[0]]
                 loss = loss + cfg.aux_weights["p"] * bce(aux["p"], c)
                 loss = loss + cfg.aux_weights["n_buy"] * mse(aux["n_buy"], nbuy)
                 loss = loss + cfg.aux_weights["n_ord"] * mse(aux["n_ord"], nord)
@@ -586,6 +627,21 @@ def main() -> None:
         D = float((dz_a ** 2).mean()); C = float((e * dz_a).mean())
         alpha = C / max(D, 1e-12)
         dt = dt_test; dz_t = predict(dt)
+        # Направление на ЯКОРЕ ПОДБОРА тоже честное: модель обучалась строго
+        # на более ранних якорях. Нужно для сборки сильной базы.
+        _tag0 = a.out.stem
+        np.savez_compressed(a.out.parent / f"{_tag0}_dz_a{alpha_anchor}.npz",
+                            user_id=np.asarray(da.user_id), dz=np.asarray(dz_a),
+                            z0=np.asarray(da.z0), z=np.asarray(da.z))
+        print(f"  направление на якоре подбора сохранено: "
+              f"{_tag0}_dz_a{alpha_anchor}.npz", flush=True)
+        # Направление сохраняется на диск: без этого модель после прогона
+        # теряется и маржинальный ресурс поверх стека не посчитать.
+        _tag = a.out.stem
+        np.savez_compressed(a.out.parent / f"{_tag}_dz_a{test_anchor}.npz",
+                            user_id=np.asarray(dt.user_id), dz=np.asarray(dz_t),
+                            z0=np.asarray(dt.z0), z=np.asarray(dt.z))
+        print(f"  направление сохранено: {_tag}_dz_a{test_anchor}.npz", flush=True)
         base = float((dt.z - dt.z0).std())
         got = float((dt.z - dt.z0 - alpha * dz_t).std())
 
