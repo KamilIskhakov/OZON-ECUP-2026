@@ -46,3 +46,18 @@ artifacts/neural/pretrain/
 !artifacts/submission_v22_annual.csv
 
 !artifacts/submission_v23_annual_opt.csv
+!artifacts/submission_v25_facthead.csv
+!artifacts/submission_v27_life.csv
+!artifacts/submission_v28_life_a024.csv
+!artifacts/submission_v29_blend18.csv
+!artifacts/submission_v30_extrap22.csv
+!artifacts/submission_v31_vertex.csv
+!artifacts/submission_v32_span20.csv
+!artifacts/submission_v33_gruprod.csv
+!artifacts/submission_v34_gru094.csv
+!artifacts/submission_v35_gruens.csv
+!artifacts/submission_v36_btyd.csv
+!artifacts/submission_v37_hull2d.csv
+!artifacts/submission_v38_tcn.csv
+!artifacts/submission_v39_tcn_opt.csv
+!artifacts/submission_final_hedge33.csv
